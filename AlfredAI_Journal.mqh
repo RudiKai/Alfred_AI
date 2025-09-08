@@ -7,10 +7,11 @@
 #ifndef ALFREDAI_JOURNAL_MQH
 #define ALFREDAI_JOURNAL_MQH
 
+// --- New Code for AlfredAI_Journal.mqh ---
 #property strict
 
-#include "AlfredAI_Utils.mqh"
-#include "AlfredAI_FileRotator.mqh"
+#include <AAI/AlfredAI_Utils.mqh>
+#include <AAI/AlfredAI_FileRotator.mqh>
 
 //+------------------------------------------------------------------+
 //| Manages the structured logging for the AlfredAI system.          |
