@@ -60,6 +60,7 @@ int slowMA_handle = INVALID_HANDLE;
 static datetime g_last_log_time = 0;
 static datetime g_last_ze_fail_log_time = 0;
 static datetime g_last_bc_fail_log_time = 0;
+static datetime g_last_warmup_ind_log_time = 0; // T003
 
 //+------------------------------------------------------------------+
 //| Custom indicator initialization function                         |
@@ -134,8 +135,16 @@ int OnCalculate(const int rates_total,
                 const long &volume[],
                 const int &spread[])
 {
+    // --- Warmup Guard (T003) ---
     if(rates_total < SB_WarmupBars)
     {
+        datetime barTime = time[rates_total-1];
+        if(g_last_warmup_ind_log_time != barTime)
+        {
+            PrintFormat("[WARMUP_IND] name=SignalBrain t=%s needed=%d have=%d", TimeToString(barTime), SB_WarmupBars, rates_total);
+            g_last_warmup_ind_log_time = barTime;
+        }
+
         // During warmup, write neutral values to all available bars to prevent stale data
         for(int i = 0; i < rates_total; i++)
         {
@@ -144,15 +153,11 @@ int OnCalculate(const int rates_total,
             ReasonCodeBuffer[i] = REASON_NONE;
             ZoneTFBuffer[i] = 0;
         }
-        return(0);
+        return(rates_total);
     }
     
-    int start_bar = rates_total - 2;
-    if(prev_calculated > 0)
-    {
-        start_bar = rates_total - prev_calculated;
-    }
-    start_bar = MathMax(1, start_bar); // Ensure we process at least the last closed bar
+    int start_bar = (prev_calculated == 0 ? rates_total - 1 : rates_total - prev_calculated);
+    start_bar = MathMax(1, start_bar);
 
     // Handle SafeTest mode separately for simple MA cross test signals
     if(SB_SafeTest)
@@ -291,3 +296,4 @@ int OnCalculate(const int rates_total,
     return(rates_total);
 }
 //+------------------------------------------------------------------+
+
