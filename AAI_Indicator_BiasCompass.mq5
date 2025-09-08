@@ -30,6 +30,7 @@ int g_slowMA_handle = INVALID_HANDLE;
 
 // --- Globals ---
 static datetime g_last_log_time = 0;
+static datetime g_last_warmup_ind_log_time = 0; // T003
 
 
 //+------------------------------------------------------------------+
@@ -80,19 +81,21 @@ int OnCalculate(const int rates_total,
                 const long &volume[],
                 const int &spread[])
 {
-    // --- Warmup Guard ---
+    // --- Warmup Guard (T003) ---
     if(rates_total < BC_WarmupBars)
     {
-        for(int i = 0; i < rates_total; i++) BiasBuffer[i] = 0;
-        return(0);
+        datetime barTime = time[rates_total-1];
+        if(g_last_warmup_ind_log_time != barTime)
+        {
+            PrintFormat("[WARMUP_IND] name=BiasCompass t=%s needed=%d have=%d", TimeToString(barTime), BC_WarmupBars, rates_total);
+            g_last_warmup_ind_log_time = barTime;
+        }
+        for(int i = 0; i < rates_total; i++) BiasBuffer[i] = 0.0;
+        return(rates_total);
     }
 
     // --- Determine start bar for calculation ---
-    int start_bar = rates_total - 2;
-    if(prev_calculated > 0)
-    {
-        start_bar = rates_total - prev_calculated;
-    }
+    int start_bar = (prev_calculated == 0 ? rates_total - 1 : rates_total - prev_calculated);
     start_bar = MathMax(1, start_bar);
 
     // --- Loop backwards to calculate bias for new bars ---
@@ -134,3 +137,4 @@ int OnCalculate(const int rates_total,
     return(rates_total);
 }
 //+------------------------------------------------------------------+
+
