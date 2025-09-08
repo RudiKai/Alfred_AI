@@ -41,7 +41,7 @@ double m30ZoneBuffer[];
 #property indicator_label6  "M15_Zone"
 double m15ZoneBuffer[];
 
-#include <AAI_Include_Settings.mqh>
+#include <AAI//AAI_Include_Settings.mqh>
 
 SAlfred Alfred;
 int    maHandle = INVALID_HANDLE;
