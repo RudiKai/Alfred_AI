@@ -3,17 +3,18 @@
 //|                   Copyright 2025, AlfredAI Project               |
 //|                 https://github.com/rudikai/alfredai              |
 //+------------------------------------------------------------------+
+// --- New Code for AlfredAI_Strategy.mqh ---
 #ifndef ALFREDAI_STRATEGY_MQH
 #define ALFREDAI_STRATEGY_MQH
 
 #property strict
 
-#include "AlfredAI_Config.mqh"
-#include "AlfredAI_Utils.mqh"
-#include "AlfredAI_Journal.mqh"
-#include "AlfredAI_RiskManager.mqh"
-#include "AlfredAI_Signal_IF.mqh"
-#include "AlfredAI_Alerts.mqh"
+#include <AAI/AlfredAI_Config.mqh>
+#include <AAI/AlfredAI_Utils.mqh>
+#include <AAI/AlfredAI_Journal.mqh>
+#include <AAI/AlfredAI_RiskManager.mqh>
+#include <AAI/AlfredAI_Signal_IF.mqh>
+#include <AAI/AlfredAI_Alerts.mqh>
 #include <Trade\Trade.mqh>
 
 //--- A dummy signal provider for testing purposes
