@@ -7,10 +7,11 @@
 #ifndef ALFREDAI_SIGNAL_IF_MQH
 #define ALFREDAI_SIGNAL_IF_MQH
 
+// --- New Code for AlfredAI_Signal_IF.mqh ---
 #property strict
 
-#include "AlfredAI_Config.mqh"
-#include "AlfredAI_Utils.mqh"
+#include <AAI/AlfredAI_Config.mqh>
+#include <AAI/AlfredAI_Utils.mqh>
 
 //+------------------------------------------------------------------+
 //| Structure to hold a trading signal                               |
