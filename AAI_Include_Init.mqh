@@ -3,10 +3,11 @@
 //|                v2.0 - Defaults & Init Function                   |
 //|              Copyright 2025, AlfredAI Project                    |
 //+------------------------------------------------------------------+
+// --- New Code for AAI_Include_Init.mqh ---
 #ifndef __AAI_INCLUDE_INIT__
 #define __AAI_INCLUDE_INIT__
 
-#include <AAI_Include_Settings.mqh>
+#include <AAI/AAI_Include_Settings.mqh>
 
 // Call this once from your OnInit()
 void InitAlfredSettings()
