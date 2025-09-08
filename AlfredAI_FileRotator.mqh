@@ -7,9 +7,10 @@
 #ifndef ALFREDAI_FILEROTATOR_MQH
 #define ALFREDAI_FILEROTATOR_MQH
 
+// --- New Code for AlfredAI_FileRotator.mqh ---
 #property strict
 
-#include "AlfredAI_Utils.mqh"
+#include <AAI/AlfredAI_Utils.mqh>
 
 //+------------------------------------------------------------------+
 //| Manages a log file with automatic size-based rotation.           |
