@@ -3,12 +3,12 @@
 //|                   Copyright 2025, AlfredAI Project               |
 //|                 https://github.com/rudikai/alfredai              |
 //+------------------------------------------------------------------+
+// --- New Code for AlfredAI_EA_Base.mq5 ---
 #property strict
 #property version   "1.10" // Corrected version format
 #property description "Core trading Expert Advisor for the AlfredAI project."
-
-#include "AlfredAI_Utils.mqh"
-#include "AlfredAI_Journal.mqh"
+#include <AAI/AlfredAI_Utils.mqh>
+#include <AAI/AlfredAI_Journal.mqh>
 
 //--- Global variables
 AAI_Journal g_journal;
