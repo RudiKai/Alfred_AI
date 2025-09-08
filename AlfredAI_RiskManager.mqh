@@ -6,7 +6,8 @@
 #ifndef ALFREDAI_RISKMANAGER_MQH
 #define ALFREDAI_RISKMANAGER_MQH
 
-#include "AlfredAI_Config.mqh"
+// --- New Code for AlfredAI_RiskManager.mqh ---
+#include <AAI/AlfredAI_Config.mqh>
 
 //+------------------------------------------------------------------+
 //| AAI_RiskManager Class                                            |
