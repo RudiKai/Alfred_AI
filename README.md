@@ -1,141 +1,109 @@
-Awesome—here’s a **drop-in README block** for your repo root. It’s short, practical, and matches what you’ve got running now.
+Alfred AI — Operator Quickstart Guide (TradeManager)
+This guide provides the essential steps to compile, configure, and run the AAI_EA_TradeManager.mq5 Expert Advisor in MetaTrader 5.
 
----
+1. File Structure & Compilation
+Ensure your file structure matches the following before compiling.
 
-# Alfred\_AI — Quick Start (MT5)
+A. Required File Paths
+The EA uses a subfolder to keep indicators organized. All indicator files must be placed in MQL5\Indicators\AlfredAI\.
 
-A minimal, compile-clean baseline for the Alfred\_AI Expert Advisor on **MetaTrader 5**.
+EA: MQL5\Experts\AlfredAI\AAI_EA_TradeManager.mq5
 
-## Repo layout (key files)
+Indicators:
 
-```
-MQL5/
-  Experts/
-    AlfredAI/
-      AlfredAI_Strategy.mq5        # Runner EA (compiles clean)
-  Include/
-    AAI/
-      AAI_ConfigINI.mqh            # v0.3 – tiny INI loader
-      AAI_SignalProvider_SignalBrain.mqh  # v0.3 – signal provider stub (RSI demo optional)
-  Files/
-    AAI/
-      config.ini                   # sample config (optional but recommended)
-```
+MQL5\Indicators\AlfredAI\AAI_Indicator_SignalBrain.mq5
 
-## Requirements
+MQL5\Indicators\AlfredAI\AAI_Indicator_ZoneEngine.mq5
 
-* MetaTrader 5 + MetaEditor (Windows; build ≥ 5260 recommended)
-* Place this repo under your terminal’s **MQL5** directory (or symlink it)
+MQL5\Indicators\AlfredAI\AAI_Indicator_BiasCompass.mq5
 
-Typical Windows path:
+MQL5\Indicators\AlfredAI\AAI_Indicator_SMC.mq5
 
-```
-C:\Users\<you>\AppData\Roaming\MetaQuotes\Terminal\<ID>\MQL5\
-```
+B. Compile
+In MetaEditor, right-click the MQL5 folder in the Navigator and select Compile. The build should complete with 0 errors and 0 warnings.
 
-## Install
+2. Key EA Inputs
+When attaching AAI_EA_TradeManager.mq5 to a chart, review these core settings:
 
-1. Copy or clone the repo so the **MQL5** folder in this repo merges with your terminal’s **MQL5**.
-2. Ensure these folders exist (create if missing):
+WarmupBars: Number of historical bars required before the EA starts evaluating signals.
 
-```
-MQL5\Files\AAI\
-MQL5\Files\AAI\logs\
-MQL5\Files\AAI\data\
-```
+ExecutionMode:
 
-## Build
+SignalsOnly: The EA will log per-bar status (AAI|k=v...) and HUD data but will not place trades.
 
-### From MetaEditor
+AutoExecute: The EA will automatically place trades when all conditions are met.
 
-* Open **MetaEditor** → **Navigator** → right-click **MQL5 → Experts → Compile**.
-  You should see: **43 files total (0 failed), 0 errors, 0 warnings**.
+ApprovalMode:
 
-### From CLI (optional)
+None: Trades are placed automatically (if ExecutionMode is AutoExecute).
 
-```bat
-"C:\Program Files\MetaTrader 5\metaeditor64.exe" ^
-  /compile:"MQL5\Experts\AlfredAI\AlfredAI_Strategy.mq5" ^
-  /log:"build.log"
-```
+Manual: A trade idea is generated, but it requires manual approval via a Global Variable before execution.
 
-## Configure (optional but recommended)
+ZoneGate:
 
-Create `MQL5\Files\AAI\config.ini`:
+ZE_OFF: ZoneEngine strength is ignored.
 
-```ini
-[Risk]
-enabled  = yes
-max_risk = 0.75
+ZE_PREFERRED: Trades are allowed even in weak zones, but signals in strong zones may be prioritized.
 
-[Session]
-name = RUDI-001
-```
+ZE_REQUIRED: Trades are blocked if zone strength is below InpZE_MinStrength.
 
-On EA init you’ll see:
+MaxSpreadPoints: Hard limit for the allowable spread in points. Entries are blocked if the current spread exceeds this value.
 
-```
-[AAI][INIT] Session=RUDI-001 | Risk.enabled=true | Risk.max_risk=0.7500
-```
+MaxSlippagePoints: The maximum slippage in points allowed when sending a trade order.
 
-## Run a smoke test (Strategy Tester)
+OverExtMode:
 
-* Symbol/TF: **EURUSD, M15**
-* Dates: e.g. **2025-01-01 → 2025-03-01**
-* Model: **Every tick based on real ticks**
-* Expert: `Experts\AlfredAI\AlfredAI_Strategy.ex5`
+HardBlock: Immediately blocks trades if the price is over-extended beyond the MA/ATR bands.
 
-You should see init logs and RiskManager day-reset logs. By default the signal provider returns **no trades** (safe baseline).
+WaitForBand: Waits for the price to return inside the bands before executing a trade.
 
-### Want trades immediately?
+3. Running QA and Self-Tests
+Use the provided scripts to verify the system is functioning correctly.
 
-Enable a tiny **RSI cross** demo rule:
+AAI_Script_QA_Smoke.mq5:
 
-**Option A (recommended):** define the flag in the EA *before* the include:
+Action: Run this script to generate an up-to-date manual test plan.
 
-```cpp
-#define AAI_SB_ENABLE_RSI 1
-#include <AAI/AAI_SignalProvider_SignalBrain.mqh>
-```
+Output: Creates MQL5/Files/AAI_QA_Checklist.md with step-by-step verification instructions.
 
-**Option B:** open the header and uncomment the same define.
+AAI_Script_SelfTest_BC_ZE.mq5:
 
-This creates occasional BUY/SELL signals when RSI crosses 30/70.
+Action: Run this script on a chart to validate indicator contracts.
 
-## What’s included
+Output: Prints the last 10 closed-bar values for BiasCompass (bias) and ZoneEngine (strength) to the Experts log.
 
-* **Config loader** (`AAI_ConfigINI.mqh v0.3`): case-insensitive `[Section] key=value` with defaults.
-* **Signal provider** (`AAI_SignalProvider_SignalBrain.mqh v0.3`): returns “no signal” by default; optional RSI demo behind `AAI_SB_ENABLE_RSI`. Uses your project’s `AAI_Signal` (camelCase fields) from `AlfredAI_Signal_IF.mqh`.
-* **Strategy runner** (`AlfredAI_Strategy.mq5`): loads config, prints session/risk on init, sets 1s timer.
+4. Logs & Data Files
+The EA generates several outputs for analysis:
 
-## Troubleshooting
+Per-Bar Status (Experts Log):
 
-* **“Config not found”**
-  Create `MQL5\Files\AAI\config.ini` (see sample) or ignore—the EA uses defaults.
-* **No trades in tester**
-  That’s expected unless you enable the RSI demo or wire a real provider into `CAlfredStrategy`.
-* **Folder errors / missing paths**
-  Ensure `MQL5\Files\AAI\`, `logs\`, `data\` exist. In code, call a helper like:
+A single line is printed to the Experts log for every closed bar.
 
-  ```cpp
-  bool EnsureFolder(const string rel){ if(FileIsExist(rel)) return true; return FolderCreate(rel); }
-  ```
-* **Duplicate `AAI_Signal` type**
-  Only define `struct AAI_Signal` once (in `AlfredAI_Signal_IF.mqh`). The provider includes that file; it should not redeclare the struct.
-* **Weird `[` parser errors**
-  Remove any stray AI citation tags like `[cite_start]` / `[cite: 27]` from headers.
+Format: AAI|t=...|sym=...|tf=...|sig=...|conf=...|reason=...|ze=...|bc=...|mode=...
 
-## Contributing
+Daily Trade Journal (CSV):
 
-* Keep headers free of `#property`/`#pragma once`.
-* Use includes as `<AAI/...>`.
-* Preserve **0 errors, 0 warnings**.
-* Prefer adding small smoke-tests to Strategy Tester for any new module.
+Location: MQL5/Files/AAI_Journal_YYYYMMDD.csv
 
-## License
+Content: Contains a detailed, one-line entry for every closed trade, including entry/exit details, signal confidence, and reason codes. The file starts with a header row.
 
-TBD.
+Deinitialization Summary (Experts Log):
 
----
+A final summary line is printed when the EA is shut down or a backtest ends.
 
-If you want, I can also add a tiny “Getting Trades” section in the README that shows how to inject the provider into `CAlfredStrategy` (one setter call) so future you doesn’t have to remember.
+Format: AAI_SUMMARY|entries=...|wins=...|losses=...|ze_blk=...|bc_blk=...|overext_blk=...|spread_blk=...
+
+5. Manual Approval Workflow
+To manually approve a trade when ApprovalMode is set to Manual:
+
+Wait for the EA to identify a trade opportunity on a closed bar. The log will show an [EVT_IDEA] line.
+
+Run the AAI_Script_ApproveTrade.mq5 script on the same chart.
+
+This script creates a specific Global Variable that the EA is listening for:
+
+Key Format: AAI_APPROVE_<symbol>_<tfInt>_<barTime>
+
+Example: AAI_APPROVE_EURUSD_15_1672531200
+
+The EA will detect the variable, execute the trade, and immediately reset the variable to 0.0 to prevent duplicate entries.
