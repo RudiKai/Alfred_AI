@@ -13,6 +13,7 @@
 #property indicator_plots   1 // Canonical Strength at plot 0
 #property indicator_buffers 1
 
+// --- CONTRACT: Buffer 0 / Plot 0 is ZE_Strength (double >= 0) ---
 #property indicator_type1   DRAW_NONE
 #property indicator_label1  "ZE_Strength"
 double ZE_StrengthBuf[];
@@ -22,6 +23,7 @@ double ZE_StrengthBuf[];
 //--- Indicator Inputs ---
 input double MinImpulseMovePips = 10.0;
 input bool   ZE_TelemetryEnabled = true;
+input int    ZE_WarmupBars = 200; // T003
 
 // --- Struct for analysis results ---
 struct ZoneAnalysis
@@ -44,6 +46,9 @@ int CalculateZoneStrength(const ZoneAnalysis &zone, ENUM_TIMEFRAMES tf, int shif
 bool HasVolumeConfirmation(ENUM_TIMEFRAMES tf, int shift, int base_candle_index, int num_candles);
 bool HasLiquidityGrab(ENUM_TIMEFRAMES tf, int shift, int base_candle_index, bool isDemandZone);
 
+// --- Globals for one-time logging ---
+static datetime g_last_warmup_log_time = 0; // T003
+
 //+------------------------------------------------------------------+
 //| Initialization                                                   |
 //+------------------------------------------------------------------+
@@ -56,6 +61,7 @@ int OnInit()
         return(INIT_FAILED);
     }
     ArraySetAsSeries(ZE_StrengthBuf, true);
+    PlotIndexSetDouble(0, PLOT_EMPTY_VALUE, 0.0);
     // === END Spec ===
 
     return(INIT_SUCCEEDED);
@@ -83,47 +89,60 @@ int OnCalculate(const int rates_total,
                 const long &volume[],
                 const int &spread[])
 {
-    const int WARMUP = 100;
-    if(rates_total <= WARMUP)
+    // --- T003: Warmup Guard ---
+    if(rates_total < ZE_WarmupBars)
     {
-        return(0);
-    }
-
-    // --- We only need to calculate for the last closed bar ---
-    int closed_bar_shift = 1;
-    int closed_bar_idx = rates_total - 1 - closed_bar_shift;
-
-    // --- Determine active zone and strength ---
-    ZoneAnalysis demandZone = FindZone(_Period, true, closed_bar_shift);
-    ZoneAnalysis supplyZone = FindZone(_Period, false, closed_bar_shift);
-
-    double strength = 0.0;
-    double barClose = close[closed_bar_idx];
-
-    bool isInDemand = demandZone.isValid && (barClose >= demandZone.distal && barClose <= demandZone.proximal);
-    bool isInSupply = supplyZone.isValid && (barClose >= supplyZone.proximal && barClose <= supplyZone.distal);
-
-    if(isInDemand)
-    {
-        strength = demandZone.strengthScore;
-    }
-    else if(isInSupply)
-    {
-        strength = supplyZone.strengthScore;
-    }
-
-    // --- Write to buffers ---
-    ZE_StrengthBuf[1] = strength; // Write to closed bar
-    ZE_StrengthBuf[0] = strength; // Mirror to current bar
-
-    // --- Telemetry for the calculated bar ---
-    if(ZE_TelemetryEnabled)
-    {
-        static datetime last_log_time = 0;
-        if(time[closed_bar_idx] != last_log_time)
+        if(rates_total > 1 && time[rates_total-2] != g_last_warmup_log_time)
         {
-            PrintFormat("[ZE_EMIT] t=%s strength=%.1f", TimeToString(time[closed_bar_idx]), strength);
-            last_log_time = time[closed_bar_idx];
+            PrintFormat("[WARMUP_IND] name=ZoneEngine t=%s needed=%d have=%d", 
+                        TimeToString(time[rates_total-2]), ZE_WarmupBars, rates_total);
+            g_last_warmup_log_time = time[rates_total-2];
+        }
+        ZE_StrengthBuf[1] = 0; // Neutral value for last closed bar
+        ZE_StrengthBuf[0] = 0; // Mirror to current bar
+        return(rates_total);
+    }
+
+    int start_bar = (prev_calculated == 0 ? rates_total - 1 : rates_total - prev_calculated);
+    start_bar = MathMax(1, start_bar);
+
+    static datetime last_log_time = 0;
+
+    for(int i = start_bar; i >= 1; --i)
+    {
+        int closed_bar_idx = i; // Adjusted for series arrays
+
+        // --- Determine active zone and strength ---
+        ZoneAnalysis demandZone = FindZone(_Period, true, i);
+        ZoneAnalysis supplyZone = FindZone(_Period, false, i);
+
+        double strength = 0.0;
+        double barClose = close[i];
+
+        bool isInDemand = demandZone.isValid && (barClose >= demandZone.distal && barClose <= demandZone.proximal);
+        bool isInSupply = supplyZone.isValid && (barClose >= supplyZone.proximal && barClose <= supplyZone.distal);
+
+        if(isInDemand)
+        {
+            strength = demandZone.strengthScore;
+        }
+        else if(isInSupply)
+        {
+            strength = supplyZone.strengthScore;
+        }
+
+        // --- Write to buffers ---
+        ZE_StrengthBuf[i] = strength;
+        if(i == 1) ZE_StrengthBuf[0] = strength; // mirror last closed bar to current bar
+
+        // --- telemetry (throttled via last_log_time) ---
+        if(ZE_TelemetryEnabled)
+        {
+            if(last_log_time != time[i])
+            {
+                PrintFormat("[ZE_EMIT] t=%s strength=%.1f", TimeToString(time[i]), strength);
+                last_log_time = time[i];
+            }
         }
     }
 
@@ -250,3 +269,4 @@ bool HasLiquidityGrab(ENUM_TIMEFRAMES tf, int shift, int base_candle_index, bool
    return (isDemandZone ? (grab_candle_wick < target_liquidity_level) : (grab_candle_wick > target_liquidity_level));
 }
 //+------------------------------------------------------------------+
+
