@@ -25,9 +25,9 @@ string GetChecklistContent()
    content += "  - **Expected:** The build completes with 0 errors and 0 warnings.\n\n";
 
    content += "## 2. Journaling System\n";
-   content += "- [ ] **EA Heartbeat:** Attach `AlfredAI_Strategy.mq5` to a chart.\n";
+   content += "- [ ] **EA Heartbeat:** Attach `AAI_EA_TradeManager.mq5` to a chart.\n";
    content += "  - **Expected:** The `AAI_Journal_<session>.log` file is created and an `Init` line is written.\n";
-   content += "- [ ] **Backtest Logs:** Run a short backtest on `AlfredAI_Strategy.mq5`.\n";
+   content += "- [ ] **Backtest Logs:** Run a short backtest on `AAI_EA_TradeManager.mq5`.\n";
    content += "  - **Expected:** The journal contains exactly one `BacktestStart` and one `BacktestEnd` event for the run.\n\n";
 
    content += "## 3. Risk Management\n";
