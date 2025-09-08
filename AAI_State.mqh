@@ -7,9 +7,10 @@
 #ifndef ALFREDAI_STATE_MQH
 #define ALFREDAI_STATE_MQH
 
+// --- New Code for AAI_State.mqh ---
 #property strict
 
-#include "AlfredAI_Utils.mqh"
+#include <AAI/AlfredAI_Utils.mqh>
 
 //+------------------------------------------------------------------+
 //| Manages persistent state for the EA                              |
