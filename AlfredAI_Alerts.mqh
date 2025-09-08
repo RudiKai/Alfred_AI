@@ -6,11 +6,12 @@
 #ifndef ALFREDAI_ALERTS_MQH
 #define ALFREDAI_ALERTS_MQH
 
+// --- New Code for AlfredAI_Alerts.mqh ---
 #property strict
 
-#include "AlfredAI_Utils.mqh"
-#include "AlfredAI_Config.mqh"
-#include "AlfredAI_Journal.mqh"
+#include <AAI/AlfredAI_Utils.mqh>
+#include <AAI/AlfredAI_Config.mqh>
+#include <AAI/AlfredAI_Journal.mqh>
 
 class AAI_Alerts
   {
