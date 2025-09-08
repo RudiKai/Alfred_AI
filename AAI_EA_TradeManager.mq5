@@ -448,7 +448,7 @@ void UpdateHUD()
     Read1(bc_handle, BC_BUF_HTF_BIAS, readShift, bc, "");
 
     string hudText = StringFormat("HUD: t=%s sig=%d conf=%.0f reason=%d ze=%.1f bc=%d",
-                                  TimeToString(closedBarTime, "%H:%M"),
+                                  TimeToString(closedBarTime, TIME_MINUTES),
                                   (int)sig,
                                   conf,
                                   (int)reason,
@@ -497,7 +497,10 @@ void LogPerBarStatus()
     string tfStr = TFToStringShort(SignalTimeframe);
     
     // --- T005: Write to daily CSV file ---
-    string ymd = TimeToString(closedBarTime, "%Y%m%d");
+MqlDateTime __dt; 
+TimeToStruct(closedBarTime, __dt);
+string ymd = StringFormat("%04d%02d%02d", __dt.year, __dt.mon, __dt.day);
+
     string filename = "AAI_Journal_" + ymd + ".csv";
     
     int handle = FileOpen(filename, FILE_READ | FILE_WRITE | FILE_CSV | FILE_SHARE_READ | FILE_ANSI, ',');
@@ -512,7 +515,7 @@ void LogPerBarStatus()
         
         FileSeek(handle, 0, SEEK_END);
         string csvRow = StringFormat("%s,%s,%s,%d,%.0f,%d,%.1f,%d,%s\n",
-                                     TimeToString(closedBarTime, "%Y.%m.%d %H:%M:%S"),
+                                     TimeToString(closedBarTime, TIME_DATE | TIME_SECONDS),
                                      _Symbol,
                                      tfStr,
                                      (int)sig,
@@ -532,7 +535,7 @@ void LogPerBarStatus()
 
     // --- T004: Print to terminal for live view ---
     string logLine = StringFormat("AAI|t=%s|sym=%s|tf=%s|sig=%d|conf=%.0f|reason=%d|ze=%.1f|bc=%d|mode=%s",
-                                  TimeToString(closedBarTime, "%Y.%m.%d %H:%M:%S"),
+                                  TimeToString(closedBarTime, TIME_DATE | TIME_SECONDS),
                                   _Symbol,
                                   tfStr,
                                   (int)sig,
