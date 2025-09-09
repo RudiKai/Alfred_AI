@@ -154,6 +154,20 @@ int CurrentSpreadPoints()
     if(_Point <= 0.0) return(INT_MAX);
     return (int)MathRound((t.ask - t.bid) / _Point);
 }
+// --- Timeframe label helpers ---
+inline string TfLabel(ENUM_TIMEFRAMES tf) {
+   string s = EnumToString(tf);                  // e.g., "PERIOD_M15"
+   int p = StringFind(s, "PERIOD_");
+   return (p == 0 ? StringSubstr(s, 7) : s);     // → "M15"
+}
+
+inline string CurrentTfLabel() {
+   ENUM_TIMEFRAMES eff = (SignalTimeframe == PERIOD_CURRENT)
+                         ? (ENUM_TIMEFRAMES)_Period
+                         : SignalTimeframe;
+   return TfLabel(eff);
+}
+
 
 #endif
 
@@ -538,19 +552,21 @@ string ymd = StringFormat("%04d%02d%02d", __dt.year, __dt.mon, __dt.day);
         PrintFormat("[ERROR] T005: Could not open daily journal file %s", filename);
     }
 
+// --- T004: Print to terminal for live view ---
+string logLine = StringFormat(
+    "AAI|t=%s|sym=%s|tf=%s|sig=%d|conf=%.0f|reason=%d|ze=%.1f|bc=%d|mode=%s",
+    TimeToString(closedBarTime, TIME_DATE | TIME_SECONDS),
+    _Symbol,
+    tfStr,
+    (int)sig,
+    conf,
+    (int)reason,
+    ze,
+    (int)bc,
+    EnumToString(ExecutionMode)
+);
+Print(logLine);
 
-    // --- T004: Print to terminal for live view ---
-    string logLine = StringFormat("AAI|t=%s|sym=%s|tf=%s|sig=%d|conf=%.0f|reason=%d|ze=%.1f|bc=%d|mode=%s",
-                                  TimeToString(closedBarTime, TIME_DATE | TIME_SECONDS),
-                                  _Symbol,
-                                  tfStr,
-                                  (int)sig,
-                                  conf,
-                                  (int)reason,
-                                  ze,
-                                  (int)bc,
-                                  EnumToString(ExecutionMode));
-    Print(logLine);
 }
 
 //+------------------------------------------------------------------+
