@@ -62,52 +62,68 @@ static datetime g_last_ze_fail_log_time = 0;
 static datetime g_last_bc_fail_log_time = 0;
 static datetime g_last_warmup_ind_log_time = 0; // T003
 
+#define AAI_IND_PREFIX "AlfredAI\\"
+inline string AAI_Ind(const string name)
+{
+   // If already prefixed with AlfredAI\, leave it; otherwise add it.
+   if(StringFind(name, AAI_IND_PREFIX) == 0)
+      return name;
+   return AAI_IND_PREFIX + name;
+}
+
 //+------------------------------------------------------------------+
 //| Custom indicator initialization function                         |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-    // --- Bind all 4 data buffers ---
-    SetIndexBuffer(0, SignalBuffer,     INDICATOR_DATA);
-    SetIndexBuffer(1, ConfidenceBuffer, INDICATOR_DATA);
-    SetIndexBuffer(2, ReasonCodeBuffer, INDICATOR_DATA);
-    SetIndexBuffer(3, ZoneTFBuffer,     INDICATOR_DATA);
-    // --- Set buffers as series arrays ---
-    ArraySetAsSeries(SignalBuffer,     true);
-    ArraySetAsSeries(ConfidenceBuffer, true);
-    ArraySetAsSeries(ReasonCodeBuffer, true);
-    ArraySetAsSeries(ZoneTFBuffer,     true);
+   // --- Bind all 4 data buffers ---
+   SetIndexBuffer(0, SignalBuffer,     INDICATOR_DATA);
+   SetIndexBuffer(1, ConfidenceBuffer, INDICATOR_DATA);
+   SetIndexBuffer(2, ReasonCodeBuffer, INDICATOR_DATA);
+   SetIndexBuffer(3, ZoneTFBuffer,     INDICATOR_DATA);
 
-    // --- Set empty values for buffers ---
-    PlotIndexSetDouble(0, PLOT_EMPTY_VALUE, 0.0);
-    PlotIndexSetDouble(1, PLOT_EMPTY_VALUE, 0.0);
-    PlotIndexSetDouble(2, PLOT_EMPTY_VALUE, 0.0);
-    PlotIndexSetDouble(3, PLOT_EMPTY_VALUE, 0.0);
-    IndicatorSetInteger(INDICATOR_DIGITS,0);
-    // --- Create dependent indicator handles ---
-    fastMA_handle = iMA(_Symbol, _Period, SB_FastMA, 0, MODE_SMA, PRICE_CLOSE);
-    slowMA_handle = iMA(_Symbol, _Period, SB_SlowMA, 0, MODE_SMA, PRICE_CLOSE);
-    if(fastMA_handle == INVALID_HANDLE || slowMA_handle == INVALID_HANDLE)
-    {
-        Print("[SB_ERR] Failed to create one or more MA handles. Indicator cannot function.");
-        return(INIT_FAILED);
-    }
+   // --- Set buffers as series arrays ---
+   ArraySetAsSeries(SignalBuffer,     true);
+   ArraySetAsSeries(ConfidenceBuffer, true);
+   ArraySetAsSeries(ReasonCodeBuffer, true);
+   ArraySetAsSeries(ZoneTFBuffer,     true);
 
-    if(SB_UseZE)
-    {
-        ZE_handle = iCustom(_Symbol, _Period, "AAI_Indicator_ZoneEngine");
-        if(ZE_handle == INVALID_HANDLE)
-            Print("[SB_WARN] Failed to create ZoneEngine handle. It will be ignored.");
-    }
+   // --- Set empty values for buffers ---
+   PlotIndexSetDouble(0, PLOT_EMPTY_VALUE, 0.0);
+   PlotIndexSetDouble(1, PLOT_EMPTY_VALUE, 0.0);
+   PlotIndexSetDouble(2, PLOT_EMPTY_VALUE, 0.0);
+   PlotIndexSetDouble(3, PLOT_EMPTY_VALUE, 0.0);
+   IndicatorSetInteger(INDICATOR_DIGITS, 0);
 
-    if(SB_UseBC)
-    {
-        BC_handle = iCustom(_Symbol, _Period, "AAI_Indicator_BiasCompass");
-        if(BC_handle == INVALID_HANDLE)
-            Print("[SB_WARN] Failed to create BiasCompass handle. It will be ignored.");
-    }
+   // --- Create dependent indicator handles (MAs) ---
+   fastMA_handle = iMA(_Symbol, _Period, SB_FastMA, 0, MODE_SMA, PRICE_CLOSE);
+   slowMA_handle = iMA(_Symbol, _Period, SB_SlowMA, 0, MODE_SMA, PRICE_CLOSE);
+   if(fastMA_handle == INVALID_HANDLE || slowMA_handle == INVALID_HANDLE)
+   {
+      Print("[SB_ERR] Failed to create one or more MA handles. Indicator cannot function.");
+      return(INIT_FAILED);
+   }
 
-    return(INIT_SUCCEEDED);
+   // --- Optional dependencies (always use AlfredAI\ prefix via helper) ---
+   if(SB_UseZE)
+   {
+      ZE_handle = iCustom(_Symbol, _Period, AAI_Ind("AAI_Indicator_ZoneEngine"));
+      if(ZE_handle == INVALID_HANDLE)
+         Print("[SB_WARN] Failed to create ZoneEngine handle: ", AAI_Ind("AAI_Indicator_ZoneEngine"), " (ignored)");
+   }
+
+   if(SB_UseBC)
+   {
+      BC_handle = iCustom(_Symbol, _Period, AAI_Ind("AAI_Indicator_BiasCompass"));
+      if(BC_handle == INVALID_HANDLE)
+         Print("[SB_WARN] Failed to create BiasCompass handle: ", AAI_Ind("AAI_Indicator_BiasCompass"), " (ignored)");
+   }
+
+   // (optional) quick path check
+   // Print("[SB_PATH_CHECK] ZE=", AAI_Ind("AAI_Indicator_ZoneEngine"),
+   //       " BC=", AAI_Ind("AAI_Indicator_BiasCompass"));
+
+   return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
