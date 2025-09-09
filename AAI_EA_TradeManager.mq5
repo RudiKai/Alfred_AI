@@ -51,8 +51,14 @@
 // === END Spec ===
 
 // --- EA Fixes (Part B): Indicator Path Helper ---
-#define AAI_IND_PATH "AlfredAI\\"
-inline string AAI_Ind(const string name){ return AAI_IND_PATH + name; }
+#define AAI_IND_PREFIX "AlfredAI\\"
+inline string AAI_Ind(const string name)
+{
+   if(StringFind(name, AAI_IND_PREFIX) == 0) // already prefixed
+      return name;
+   return AAI_IND_PREFIX + name;
+}
+
 
 
 // --- T006: HUD Object Name ---
@@ -846,53 +852,77 @@ int OnInit()
    g_blk_spread = 0;
    g_summary_printed = false;
 
-   symbolName = _Symbol;
-   point = SymbolInfoDouble(symbolName, SYMBOL_POINT);
-   trade.SetExpertMagicNumber(MagicNumber);
-   g_overext_wait = 0; // T011
-   g_last_entry_bar_buy=0; g_last_entry_bar_sell=0;
-   g_cool_until_buy=0; g_cool_until_sell=0;
-   
-   bool useZE = (InpZE_Gate != ZE_OFF); 
-   bool useBC = (InpBC_AlignMode != BC_OFF);
-   
-   // --- Assert Handle: SignalBrain ---
-   sb_handle = iCustom(_Symbol, SignalTimeframe, AAI_Ind("AAI_Indicator_SignalBrain"),
-                       SB_PassThrough_SafeTest, useZE, useBC,
-                       SB_PassThrough_WarmupBars, SB_PassThrough_FastMA, SB_PassThrough_SlowMA,
-                       SB_PassThrough_MinZoneStrength, SB_PassThrough_EnableDebug);
-   if(sb_handle == INVALID_HANDLE){ PrintFormat("%s handle(SB) invalid", INIT_ERROR); return(INIT_FAILED); }
-   
-   // --- Assert Handle: BiasCompass ---
-   if(useBC)
+// --- Initialize locals/state ---
+symbolName = _Symbol;
+point      = SymbolInfoDouble(symbolName, SYMBOL_POINT);
+trade.SetExpertMagicNumber(MagicNumber);
+g_overext_wait = 0;        // T011
+g_last_entry_bar_buy  = 0;
+g_last_entry_bar_sell = 0;
+g_cool_until_buy  = 0;
+g_cool_until_sell = 0;
+
+bool useZE = (InpZE_Gate != ZE_OFF);
+bool useBC = (InpBC_AlignMode != BC_OFF);
+
+// (optional) quick path check
+// Print("[PATH_CHECK] SB=", AAI_Ind("AAI_Indicator_SignalBrain"),
+//       " BC=", AAI_Ind("AAI_Indicator_BiasCompass"),
+//       " ZE=", AAI_Ind("AAI_Indicator_ZoneEngine"));
+
+// --- Assert Handle: SignalBrain ---
+sb_handle = iCustom(_Symbol, SignalTimeframe, AAI_Ind("AAI_Indicator_SignalBrain"),
+                    SB_PassThrough_SafeTest, useZE, useBC,
+                    SB_PassThrough_WarmupBars, SB_PassThrough_FastMA, SB_PassThrough_SlowMA,
+                    SB_PassThrough_MinZoneStrength, SB_PassThrough_EnableDebug);
+if(sb_handle == INVALID_HANDLE)
+{
+   PrintFormat("%s handle(SB) invalid", INIT_ERROR);
+   return(INIT_FAILED);
+}
+
+// --- Assert Handle: BiasCompass ---
+if(useBC)
+{
+   bc_handle = iCustom(_Symbol, SignalTimeframe, AAI_Ind("AAI_Indicator_BiasCompass"));
+   if(bc_handle == INVALID_HANDLE)
    {
-       bc_handle = iCustom(_Symbol, SignalTimeframe, AAI_Ind("AAI_Indicator_BiasCompass"));
-       if(bc_handle == INVALID_HANDLE){ PrintFormat("%s handle(BC) invalid", INIT_ERROR); return(INIT_FAILED); }
+      PrintFormat("%s handle(BC) invalid", INIT_ERROR);
+      return(INIT_FAILED);
+   }
+}
+
+// --- Assert Handle: ZoneEngine ---
+if(useZE)
+{
+   g_ze_handle = iCustom(_Symbol, SignalTimeframe, AAI_Ind("AAI_Indicator_ZoneEngine"));
+   if(g_ze_handle == INVALID_HANDLE)
+   {
+      PrintFormat("%s handle(ZE) invalid", INIT_ERROR);
+      return(INIT_FAILED);
    }
 
-   // --- Assert Handle: ZoneEngine ---
-   if(useZE)
-   {
-      g_ze_handle = iCustom(_Symbol, SignalTimeframe, AAI_Ind("AAI_Indicator_ZoneEngine"));
-      if(g_ze_handle == INVALID_HANDLE){ PrintFormat("%s handle(ZE) invalid", INIT_ERROR); return(INIT_FAILED); }
-      
-      g_ze_buf_eff = (InpZE_BufferIndexStrength < 0
-                  ? AAI_ZE_AutoDetectBuffer(g_ze_handle, InpZE_ReadShift)
-                  : InpZE_BufferIndexStrength);
-                  
-      PrintFormat("%s ZE gate=%s buf=%d shift=%d min=%.1f bonus=%d handle=%d",
+   g_ze_buf_eff = (InpZE_BufferIndexStrength < 0
+                   ? AAI_ZE_AutoDetectBuffer(g_ze_handle, InpZE_ReadShift)
+                   : InpZE_BufferIndexStrength);
+
+   PrintFormat("%s ZE gate=%s buf=%d shift=%d min=%d bonus=%d handle=%d",
                EVT_INIT, ZE_GateToStr((int)InpZE_Gate), g_ze_buf_eff, InpZE_ReadShift,
-               (double)InpZE_MinStrength, InpZE_PrefBonus, g_ze_handle);
-   }
+               InpZE_MinStrength, InpZE_PrefBonus, g_ze_handle);
+}
 
-   // --- Assert Handle: SMC ---
-   if(InpSMC_Mode != SMC_OFF && g_smc_handle == INVALID_HANDLE)
+// --- Assert Handle: SMC ---
+if(InpSMC_Mode != SMC_OFF && g_smc_handle == INVALID_HANDLE)
+{
+   g_smc_handle = iCustom(_Symbol, SignalTimeframe, AAI_Ind("AAI_Indicator_SMC"),
+                          SMC_UseFVG, SMC_UseOB, SMC_UseBOS,
+                          SMC_WarmupBars, SMC_FVG_MinPips, SMC_OB_Lookback, SMC_BOS_Lookback);
+   if(g_smc_handle == INVALID_HANDLE)
    {
-      g_smc_handle = iCustom(_Symbol, SignalTimeframe, AAI_Ind("AAI_Indicator_SMC"),
-                             SMC_UseFVG, SMC_UseOB, SMC_UseBOS,
-                             SMC_WarmupBars, SMC_FVG_MinPips, SMC_OB_Lookback, SMC_BOS_Lookback);
-       if(g_smc_handle == INVALID_HANDLE){ PrintFormat("%s handle(SMC) invalid", INIT_ERROR); return(INIT_FAILED); }
+      PrintFormat("%s handle(SMC) invalid", INIT_ERROR);
+      return(INIT_FAILED);
    }
+}
                
    // --- T011: Update handles for Over-extension ---
    g_hATR = iATR(_Symbol, SignalTimeframe, OverExt_ATR_Period);
