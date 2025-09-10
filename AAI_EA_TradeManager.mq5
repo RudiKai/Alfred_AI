@@ -546,72 +546,51 @@ void UpdateHUD()
 //+------------------------------------------------------------------+
 void LogPerBarStatus()
 {
-   const int readShift = 1; // Always log the last closed bar
-   datetime closedBarTime = iTime(_Symbol, SignalTimeframe, readShift);
+const int readShift = 1; // Always log the last closed bar
+datetime closedBarTime = iTime(_Symbol, SignalTimeframe, readShift);
 
-   // Prevent duplicate logs for the same bar
-   if (closedBarTime == g_last_per_bar_journal_time || closedBarTime == 0)
-      return;
-   g_last_per_bar_journal_time = closedBarTime;
+// Prevent duplicate logs for the same bar
+if (closedBarTime == g_last_per_bar_journal_time || closedBarTime == 0)
+   return;
+g_last_per_bar_journal_time = closedBarTime;
 
-   // ---- Read all required data (default to 0) ----
-   double sig = 0, conf = 0, reason = 0, ze = 0, bc = 0;
+// ---- Read all required data (default to 0) ----
+double sig = 0, conf = 0, reason = 0, ze = 0, bc = 0;
 
-   if (sb_handle == INVALID_HANDLE) return;               // core dependency
+if (sb_handle == INVALID_HANDLE) return;               // core dependency
 
-   Read1(sb_handle, SB_BUF_SIGNAL, readShift, sig,    "SB");
-   Read1(sb_handle, SB_BUF_CONF,   readShift, conf,   "SB");
-   Read1(sb_handle, SB_BUF_REASON, readShift, reason, "SB");
+Read1(sb_handle, SB_BUF_SIGNAL, readShift, sig,    "SB");
+Read1(sb_handle, SB_BUF_CONF,   readShift, conf,   "SB");
+Read1(sb_handle, SB_BUF_REASON, readShift, reason, "SB");
 
-   if (g_ze_handle != INVALID_HANDLE)
-      Read1(g_ze_handle, g_ze_buf_eff, readShift, ze, "ZE");
+if (g_ze_handle != INVALID_HANDLE)
+   Read1(g_ze_handle, g_ze_buf_eff, readShift, ze, "ZE");
 
-   if (bc_handle != INVALID_HANDLE)
-      Read1(bc_handle, BC_BUF_HTF_BIAS, readShift, bc, "BC");
+if (bc_handle != INVALID_HANDLE)
+   Read1(bc_handle, BC_BUF_HTF_BIAS, readShift, bc, "BC");
 
-   // One TF label for both CSV and AAI line
-   string tfStr = CurrentTfLabel();   // e.g. "M15", resolves PERIOD_CURRENT
+// One TF label for both CSV and AAI line
+string tfStr = CurrentTfLabel();   // e.g. "M15", resolves PERIOD_CURRENT
 
-   // ------------------ T005: Daily CSV ------------------
-   MqlDateTime __dt;
-   TimeToStruct(closedBarTime, __dt);
-   string ymd = StringFormat("%04d%02d%02d", __dt.year, __dt.mon, __dt.day);
-   string filename = "AAI_Journal_" + ymd + ".csv";
+// ------------------ T005: Daily CSV ------------------
+MqlDateTime __dt;
+TimeToStruct(closedBarTime, __dt);
+string ymd = StringFormat("%04d%02d%02d", __dt.year, __dt.mon, __dt.day);
+string filename = "AAI_Journal_" + ymd + ".csv";
 
-   int handle = FileOpen(filename,
-                         FILE_READ | FILE_WRITE | FILE_CSV | FILE_SHARE_READ | FILE_ANSI,
-                         ',');
+int handle = FileOpen(filename,
+                      FILE_READ | FILE_WRITE | FILE_CSV | FILE_SHARE_READ | FILE_ANSI,
+                      ',');
 
-   if (handle != INVALID_HANDLE)
-   {
-      // Header for new file
-      if (FileSize(handle) == 0)
-         FileWriteString(handle, "t,sym,tf,sig,conf,reason,ze,bc,mode\n");
+if (handle != INVALID_HANDLE)
+{
+   // Header for new file
+   if (FileSize(handle) == 0)
+      FileWriteString(handle, "t,sym,tf,sig,conf,reason,ze,bc,mode\n");
 
-      FileSeek(handle, 0, SEEK_END);
-      string csvRow = StringFormat(
-         "%s,%s,%s,%d,%.0f,%d,%.1f,%d,%s\n",
-         TimeToString(closedBarTime, TIME_DATE | TIME_SECONDS),
-         _Symbol,
-         tfStr,
-         (int)sig,
-         conf,
-         (int)reason,
-         ze,
-         (int)bc,
-         EnumToString(ExecutionMode)
-      );
-      FileWriteString(handle, csvRow);
-      FileClose(handle);
-   }
-   else
-   {
-      PrintFormat("[ERROR] T005: Could not open daily journal file %s", filename);
-   }
-
-   // ------------------ T004: Per-bar heartbeat ------------------
-   string logLine = StringFormat(
-      "AAI|ts=%s|sym=%s|tf=%s|sig=%d|conf=%.0f|reason=%d|ze=%.1f|bc=%d|mode=%s",
+   FileSeek(handle, 0, SEEK_END);
+   string csvRow = StringFormat(
+      "%s,%s,%s,%d,%.0f,%d,%.1f,%d,%s\n",
       TimeToString(closedBarTime, TIME_DATE | TIME_SECONDS),
       _Symbol,
       tfStr,
@@ -622,9 +601,31 @@ void LogPerBarStatus()
       (int)bc,
       EnumToString(ExecutionMode)
    );
-   Print(logLine);
-   AAI_AppendJournal(logLine);   // goes to AlfredAI_Journal.csv (Common\Files if enabled)
+   FileWriteString(handle, csvRow);
+   FileClose(handle);
 }
+else
+{
+   PrintFormat("[ERROR] T005: Could not open daily journal file %s", filename);
+}
+
+// ------------------ T004: Per-bar heartbeat ------------------
+string logLine = StringFormat(
+   "AAI|ts=%s|sym=%s|tf=%s|sig=%d|conf=%.0f|reason=%d|ze=%.1f|bc=%d|mode=%s",
+   TimeToString(closedBarTime, TIME_DATE | TIME_SECONDS),
+   _Symbol,
+   tfStr,
+   (int)sig,
+   conf,
+   (int)reason,
+   ze,
+   (int)bc,
+   EnumToString(ExecutionMode)
+);
+Print(logLine);
+AAI_AppendJournal(logLine);   // goes to AlfredAI_Journal.csv (Common\Files if enabled)
+}
+
 
 //+------------------------------------------------------------------+
 //| HYBRID Approval Helper Functions                                 |
@@ -1953,4 +1954,3 @@ void AddToLoggedList(ulong position_id)
    g_logged_positions_total = new_size;
 }
 //+------------------------------------------------------------------+
-
