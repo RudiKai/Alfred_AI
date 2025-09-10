@@ -169,6 +169,7 @@ inline string CurrentTfLabel() {
 }
 
 
+
 #endif
 
 
@@ -447,6 +448,67 @@ void PrintSummary()
                 g_blk_spread);
     g_summary_printed = true;
 }
+// ====================== AAI JOURNAL HELPERS ======================
+#ifndef AAI_EA_LOG_DEFINED
+#define AAI_EA_LOG_DEFINED
+
+// Append a line to the AlfredAI journal (Common\Files if enabled)
+void AAI_AppendJournal(const string line)
+{
+   string name = JournalFileName; // EA input
+   uint flags = FILE_WRITE | FILE_TXT;
+   if (JournalUseCommonFiles) flags |= FILE_COMMON;
+
+   int fh = FileOpen(name, flags);
+   if (fh == INVALID_HANDLE) { PrintFormat("[AAI_JOURNAL] open failed (%d)", GetLastError()); return; }
+   FileSeek(fh, 0, SEEK_END);
+   FileWriteString(fh, line + "\r\n");
+   FileFlush(fh);
+   FileClose(fh);
+}
+
+// Build & write an EXEC line (dir: +1 BUY, -1 SELL).
+// Pulls entry/SL/TP/lots from trade.Result* or the live position so you don't need local vars.
+void AAI_LogExec(const int dir, double lots_hint = 0.0, const string run_id = "adhoc")
+{
+   double entry = 0.0, sl = 0.0, tp = 0.0, lots_eff = lots_hint;
+
+   // Prefer immediate trade result (just-sent order)
+   double r_price  = trade.ResultPrice();
+   double r_volume = trade.ResultVolume();
+   if (r_price  > 0) entry    = r_price;
+   if (r_volume > 0) lots_eff = r_volume;
+
+   // Fallback to current position if needed
+   if (PositionSelect(_Symbol))
+   {
+      double pos_open = PositionGetDouble(POSITION_PRICE_OPEN);
+      double pos_sl   = PositionGetDouble(POSITION_SL);
+      double pos_tp   = PositionGetDouble(POSITION_TP);
+      double pos_vol  = PositionGetDouble(POSITION_VOLUME);
+
+      if (entry    <= 0 && pos_open > 0) entry    = pos_open;
+      if (sl       <= 0 && pos_sl   > 0) sl       = pos_sl;
+      if (tp       <= 0 && pos_tp   > 0) tp       = pos_tp;
+      if (lots_eff <= 0 && pos_vol  > 0) lots_eff = pos_vol;
+   }
+
+   string execLine = StringFormat(
+      "EXEC|ts=%s|sym=%s|tf=%s|dir=%s|lots=%.2f|entry=%.5f|sl=%.5f|tp=%.5f|rr=%.2f|run=%s",
+      TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS),
+      _Symbol,
+      CurrentTfLabel(),                     // your existing helper → "M15", "H1", ...
+      (dir > 0 ? "BUY" : "SELL"),
+      lots_eff,
+      entry, sl, tp,
+      InpFixed_RR,
+      run_id
+   );
+   Print(execLine);
+   AAI_AppendJournal(execLine);
+}
+#endif
+// ==================== /AAI JOURNAL HELPERS ======================
 
 
 //+------------------------------------------------------------------+
@@ -484,89 +546,84 @@ void UpdateHUD()
 //+------------------------------------------------------------------+
 void LogPerBarStatus()
 {
-    const int readShift = 1; // Always log the last closed bar
-    datetime closedBarTime = iTime(_Symbol, SignalTimeframe, readShift);
-    
-    // Prevent duplicate logs for the same bar
-    if(closedBarTime == g_last_per_bar_journal_time || closedBarTime == 0)
-    {
-        return;
-    }
-    g_last_per_bar_journal_time = closedBarTime;
+   const int readShift = 1; // Always log the last closed bar
+   datetime closedBarTime = iTime(_Symbol, SignalTimeframe, readShift);
 
-    // Read all required data, defaulting to 0
-    double sig = 0, conf = 0, reason = 0, ze = 0, bc = 0;
-    
-    // Core data must be available to log
-    if(sb_handle == INVALID_HANDLE) return;
+   // Prevent duplicate logs for the same bar
+   if (closedBarTime == g_last_per_bar_journal_time || closedBarTime == 0)
+      return;
+   g_last_per_bar_journal_time = closedBarTime;
 
-    Read1(sb_handle, SB_BUF_SIGNAL, readShift, sig, "SB");
-    Read1(sb_handle, SB_BUF_CONF, readShift, conf, "SB");
-    Read1(sb_handle, SB_BUF_REASON, readShift, reason, "SB");
-    
-    if (g_ze_handle != INVALID_HANDLE)
-    {
-        Read1(g_ze_handle, g_ze_buf_eff, readShift, ze, "ZE");
-    }
+   // ---- Read all required data (default to 0) ----
+   double sig = 0, conf = 0, reason = 0, ze = 0, bc = 0;
 
-    if (bc_handle != INVALID_HANDLE)
-    {
-        Read1(bc_handle, BC_BUF_HTF_BIAS, readShift, bc, "BC");
-    }
+   if (sb_handle == INVALID_HANDLE) return;               // core dependency
 
-    string tfStr = TFToStringShort(SignalTimeframe);
-    
-    // --- T005: Write to daily CSV file ---
-MqlDateTime __dt; 
-TimeToStruct(closedBarTime, __dt);
-string ymd = StringFormat("%04d%02d%02d", __dt.year, __dt.mon, __dt.day);
+   Read1(sb_handle, SB_BUF_SIGNAL, readShift, sig,    "SB");
+   Read1(sb_handle, SB_BUF_CONF,   readShift, conf,   "SB");
+   Read1(sb_handle, SB_BUF_REASON, readShift, reason, "SB");
 
-    string filename = "AAI_Journal_" + ymd + ".csv";
-    
-    int handle = FileOpen(filename, FILE_READ | FILE_WRITE | FILE_CSV | FILE_SHARE_READ | FILE_ANSI, ',');
+   if (g_ze_handle != INVALID_HANDLE)
+      Read1(g_ze_handle, g_ze_buf_eff, readShift, ze, "ZE");
 
-    if(handle != INVALID_HANDLE)
-    {
-        // Write header if the file is new/empty
-        if(FileSize(handle) == 0)
-        {
-            FileWriteString(handle, "t,sym,tf,sig,conf,reason,ze,bc,mode\n");
-        }
-        
-        FileSeek(handle, 0, SEEK_END);
-        string csvRow = StringFormat("%s,%s,%s,%d,%.0f,%d,%.1f,%d,%s\n",
-                                     TimeToString(closedBarTime, TIME_DATE | TIME_SECONDS),
-                                     _Symbol,
-                                     tfStr,
-                                     (int)sig,
-                                     conf,
-                                     (int)reason,
-                                     ze,
-                                     (int)bc,
-                                     EnumToString(ExecutionMode));
-        FileWriteString(handle, csvRow);
-        FileClose(handle);
-    }
-    else
-    {
-        PrintFormat("[ERROR] T005: Could not open daily journal file %s", filename);
-    }
+   if (bc_handle != INVALID_HANDLE)
+      Read1(bc_handle, BC_BUF_HTF_BIAS, readShift, bc, "BC");
 
-// --- T004: Print to terminal for live view ---
-string logLine = StringFormat(
-    "AAI|t=%s|sym=%s|tf=%s|sig=%d|conf=%.0f|reason=%d|ze=%.1f|bc=%d|mode=%s",
-    TimeToString(closedBarTime, TIME_DATE | TIME_SECONDS),
-    _Symbol,
-    tfStr,
-    (int)sig,
-    conf,
-    (int)reason,
-    ze,
-    (int)bc,
-    EnumToString(ExecutionMode)
-);
-Print(logLine);
+   // One TF label for both CSV and AAI line
+   string tfStr = CurrentTfLabel();   // e.g. "M15", resolves PERIOD_CURRENT
 
+   // ------------------ T005: Daily CSV ------------------
+   MqlDateTime __dt;
+   TimeToStruct(closedBarTime, __dt);
+   string ymd = StringFormat("%04d%02d%02d", __dt.year, __dt.mon, __dt.day);
+   string filename = "AAI_Journal_" + ymd + ".csv";
+
+   int handle = FileOpen(filename,
+                         FILE_READ | FILE_WRITE | FILE_CSV | FILE_SHARE_READ | FILE_ANSI,
+                         ',');
+
+   if (handle != INVALID_HANDLE)
+   {
+      // Header for new file
+      if (FileSize(handle) == 0)
+         FileWriteString(handle, "t,sym,tf,sig,conf,reason,ze,bc,mode\n");
+
+      FileSeek(handle, 0, SEEK_END);
+      string csvRow = StringFormat(
+         "%s,%s,%s,%d,%.0f,%d,%.1f,%d,%s\n",
+         TimeToString(closedBarTime, TIME_DATE | TIME_SECONDS),
+         _Symbol,
+         tfStr,
+         (int)sig,
+         conf,
+         (int)reason,
+         ze,
+         (int)bc,
+         EnumToString(ExecutionMode)
+      );
+      FileWriteString(handle, csvRow);
+      FileClose(handle);
+   }
+   else
+   {
+      PrintFormat("[ERROR] T005: Could not open daily journal file %s", filename);
+   }
+
+   // ------------------ T004: Per-bar heartbeat ------------------
+   string logLine = StringFormat(
+      "AAI|ts=%s|sym=%s|tf=%s|sig=%d|conf=%.0f|reason=%d|ze=%.1f|bc=%d|mode=%s",
+      TimeToString(closedBarTime, TIME_DATE | TIME_SECONDS),
+      _Symbol,
+      tfStr,
+      (int)sig,
+      conf,
+      (int)reason,
+      ze,
+      (int)bc,
+      EnumToString(ExecutionMode)
+   );
+   Print(logLine);
+   AAI_AppendJournal(logLine);   // goes to AlfredAI_Journal.csv (Common\Files if enabled)
 }
 
 //+------------------------------------------------------------------+
@@ -1038,9 +1095,10 @@ void PlaceOrderFromApproval()
 {
     PrintFormat("[HYBRID] Executing approved trade. Side: %s, Vol: %.2f, Entry: Market, SL: %.5f, TP: %.5f",
                 g_last_side, g_last_vol, g_last_sl, g_last_tp);
+
     trade.SetDeviationInPoints(MaxSlippagePoints);
     bool order_sent = false;
-    
+
     if(g_last_side == "BUY")
     {
         order_sent = trade.Buy(g_last_vol, symbolName, 0, g_last_sl, g_last_tp, g_last_comment);
@@ -1052,19 +1110,36 @@ void PlaceOrderFromApproval()
 
     if(order_sent && (trade.ResultRetcode() == TRADE_RETCODE_DONE || trade.ResultRetcode() == TRADE_RETCODE_DONE_PARTIAL))
     {
-       g_entries++; // T012
-       PrintFormat("%s HYBRID Signal:%s → Executed %.2f lots @%.5f | SL:%.5f TP:%.5f", EVT_ENTRY, g_last_side, trade.ResultVolume(), trade.ResultPrice(), g_last_sl, g_last_tp);
-       if(g_last_side == "BUY") g_last_entry_bar_buy = g_lastBarTime; else g_last_entry_bar_sell = g_lastBarTime;
+        g_entries++; // T012
+
+        double rvol   = trade.ResultVolume();
+        double rprice = trade.ResultPrice();
+
+        PrintFormat("%s HYBRID Signal:%s → Executed %.2f lots @%.5f | SL:%.5f TP:%.5f",
+                    EVT_ENTRY, g_last_side,
+                    (rvol > 0 ? rvol : g_last_vol),
+                    (rprice > 0 ? rprice : 0.0),
+                    g_last_sl, g_last_tp);
+
+        if(g_last_side == "BUY") g_last_entry_bar_buy = g_lastBarTime;
+        else                     g_last_entry_bar_sell = g_lastBarTime;
+
+        // --- NEW: write EXEC|... line for the dashboard/aggregator
+        int dir = (g_last_side == "BUY" ? +1 : -1);
+        double lots_hint = (rvol > 0 ? rvol : g_last_vol);
+        AAI_LogExec(dir, lots_hint, "adhoc");
+        // -----------------------------------------------
     }
     else
     {
-       if(g_lastBarTime != g_last_suppress_log_time)
-       {
-          PrintFormat("%s reason=trade_send_failed details=retcode:%d", EVT_SUPPRESS, trade.ResultRetcode());
-          g_last_suppress_log_time = g_lastBarTime;
-       }
+        if(g_lastBarTime != g_last_suppress_log_time)
+        {
+            PrintFormat("%s reason=trade_send_failed details=retcode:%d", EVT_SUPPRESS, trade.ResultRetcode());
+            g_last_suppress_log_time = g_lastBarTime;
+        }
     }
 }
+
 
 
 //+------------------------------------------------------------------+
