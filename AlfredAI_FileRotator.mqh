@@ -57,7 +57,7 @@ public:
          PrintFormat("FileRotator: Log file %s rotated.", m_base_path);
         }
 
-      m_handle = FileOpen(m_base_path, FILE_WRITE|FILE_TXT|FILE_SHARE_READ, ';', CP_UTF8);
+      m_handle = FileOpen(m_base_path, FILE_READ|FILE_WRITE|FILE_TXT|FILE_SHARE_READ|FILE_ANSI);
       if(m_handle == INVALID_HANDLE)
         {
          PrintFormat("FileRotator: Failed to open file %s. Error: %d", m_base_path, GetLastError());
