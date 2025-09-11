@@ -456,10 +456,9 @@ void PrintSummary()
 void AAI_AppendJournal(const string line)
 {
    string name = JournalFileName; // EA input
-   uint flags = FILE_WRITE | FILE_TXT;
-   if (JournalUseCommonFiles) flags |= FILE_COMMON;
-
-   int fh = FileOpen(name, flags);
+uint flags = FILE_READ | FILE_WRITE | FILE_TXT;
+  if (JournalUseCommonFiles) flags |= FILE_COMMON;
+  int fh = FileOpen(name, flags);
    if (fh == INVALID_HANDLE) { PrintFormat("[AAI_JOURNAL] open failed (%d)", GetLastError()); return; }
    FileSeek(fh, 0, SEEK_END);
    FileWriteString(fh, line + "\r\n");
@@ -494,7 +493,7 @@ void AAI_LogExec(const int dir, double lots_hint = 0.0, const string run_id = "a
    }
 
    string execLine = StringFormat(
-      "EXEC|ts=%s|sym=%s|tf=%s|dir=%s|lots=%.2f|entry=%.5f|sl=%.5f|tp=%.5f|rr=%.2f|run=%s",
+      "EXEC|t=%s|sym=%s|tf=%s|dir=%s|lots=%.2f|entry=%.5f|sl=%.5f|tp=%.5f|rr=%.2f|run=%s",
       TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS),
       _Symbol,
       CurrentTfLabel(),                     // your existing helper → "M15", "H1", ...
@@ -611,7 +610,7 @@ else
 
 // ------------------ T004: Per-bar heartbeat ------------------
 string logLine = StringFormat(
-   "AAI|ts=%s|sym=%s|tf=%s|sig=%d|conf=%.0f|reason=%d|ze=%.1f|bc=%d|mode=%s",
+   "AAI|t=%s|sym=%s|tf=%s|sig=%d|conf=%.0f|reason=%d|ze=%.1f|bc=%d|mode=%s",
    TimeToString(closedBarTime, TIME_DATE | TIME_SECONDS),
    _Symbol,
    tfStr,
