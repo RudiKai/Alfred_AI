@@ -450,33 +450,59 @@ void PrintSummary()
 #ifndef AAI_EA_LOG_DEFINED
 #define AAI_EA_LOG_DEFINED
 
-// Append a line to the AlfredAI journal (Common\Files if enabled)
+// Append a line to the AlfredAI journal.
+// In Strategy Tester / Optimization, we write ONLY to the Journal.
 void AAI_AppendJournal(const string line)
 {
-   string name = JournalFileName; // EA input
-uint flags = FILE_READ | FILE_WRITE | FILE_TXT;
-  if (JournalUseCommonFiles) flags |= FILE_COMMON;
-  int fh = FileOpen(name, flags);
-   if (fh == INVALID_HANDLE) { PrintFormat("[AAI_JOURNAL] open failed (%d)", GetLastError()); return; }
+   if (MQLInfoInteger(MQL_TESTER) || MQLInfoInteger(MQL_OPTIMIZATION))
+   {
+      Print(line);
+      return;
+   }
+
+   // Live/demo: write to file (optional) and also mirror to Experts log
+   string name       = JournalFileName;       // EA input (string)
+   bool   use_common = JournalUseCommonFiles; // EA input (bool)
+
+   if (name == NULL || name == "")
+   {
+      Print(line);
+      return;
+   }
+
+   uint flags = FILE_READ | FILE_WRITE | FILE_TXT;
+   if (use_common) flags |= FILE_COMMON;
+
+   int fh = FileOpen(name, flags);
+   if (fh == INVALID_HANDLE)
+   {
+      PrintFormat("[AAI_JOURNAL] open failed (%d) for '%s'", GetLastError(), name);
+      Print(line);
+      return;
+   }
+
    FileSeek(fh, 0, SEEK_END);
    FileWriteString(fh, line + "\r\n");
    FileFlush(fh);
    FileClose(fh);
+
+   // Mirror to Experts log in live/demo
+   Print(line);
 }
 
 // Build & write an EXEC line (dir: +1 BUY, -1 SELL).
-// Pulls entry/SL/TP/lots from trade.Result* or the live position so you don't need local vars.
+// Pulls entry/SL/TP/lots from trade.Result* or the current position.
 void AAI_LogExec(const int dir, double lots_hint = 0.0, const string run_id = "adhoc")
 {
    double entry = 0.0, sl = 0.0, tp = 0.0, lots_eff = lots_hint;
 
-   // Prefer immediate trade result (just-sent order)
+   // Prefer immediate trade result (just sent order)
    double r_price  = trade.ResultPrice();
    double r_volume = trade.ResultVolume();
-   if (r_price  > 0) entry    = r_price;
-   if (r_volume > 0) lots_eff = r_volume;
+   if (r_price  > 0.0) entry    = r_price;
+   if (r_volume > 0.0) lots_eff = r_volume;
 
-   // Fallback to current position if needed
+   // Fallback: live position
    if (PositionSelect(_Symbol))
    {
       double pos_open = PositionGetDouble(POSITION_PRICE_OPEN);
@@ -484,28 +510,40 @@ void AAI_LogExec(const int dir, double lots_hint = 0.0, const string run_id = "a
       double pos_tp   = PositionGetDouble(POSITION_TP);
       double pos_vol  = PositionGetDouble(POSITION_VOLUME);
 
-      if (entry    <= 0 && pos_open > 0) entry    = pos_open;
-      if (sl       <= 0 && pos_sl   > 0) sl       = pos_sl;
-      if (tp       <= 0 && pos_tp   > 0) tp       = pos_tp;
-      if (lots_eff <= 0 && pos_vol  > 0) lots_eff = pos_vol;
+      if (entry    <= 0.0 && pos_open > 0.0) entry    = pos_open;
+      if (sl       <= 0.0 && pos_sl   > 0.0) sl       = pos_sl;
+      if (tp       <= 0.0 && pos_tp   > 0.0) tp       = pos_tp;
+      if (lots_eff <= 0.0 && pos_vol  > 0.0) lots_eff = pos_vol;
    }
 
+   // Format to symbol precision so numbers look right
+   int d = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    string execLine = StringFormat(
-      "EXEC|t=%s|sym=%s|tf=%s|dir=%s|lots=%.2f|entry=%.5f|sl=%.5f|tp=%.5f|rr=%.2f|run=%s",
+      "EXEC|t=%s|sym=%s|tf=%s|dir=%s|lots=%.2f|entry=%.*f|sl=%.*f|tp=%.*f|rr=%.2f|run=%s",
       TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS),
       _Symbol,
-      CurrentTfLabel(),                     // your existing helper → "M15", "H1", ...
+      CurrentTfLabel(),                 // your helper, e.g., "M15", "H1", ...
       (dir > 0 ? "BUY" : "SELL"),
       lots_eff,
-      entry, sl, tp,
-      Fixed_RR,
+      d, entry, d, sl, d, tp,
+      Fixed_RR,                         // your existing input/var
       run_id
    );
-   Print(execLine);
+
+   // Tester path: print exactly once; no file I/O
+   if (MQLInfoInteger(MQL_TESTER) || MQLInfoInteger(MQL_OPTIMIZATION))
+   {
+      Print(execLine);
+      return;
+   }
+
+   // Live/demo: file (if configured) + Experts log
    AAI_AppendJournal(execLine);
 }
+
 #endif
 // ==================== /AAI JOURNAL HELPERS ======================
+
 
 
 //+------------------------------------------------------------------+
@@ -1105,28 +1143,28 @@ void PlaceOrderFromApproval()
         order_sent = trade.Sell(g_last_vol, symbolName, 0, g_last_sl, g_last_tp, g_last_comment);
     }
 
-    if(order_sent && (trade.ResultRetcode() == TRADE_RETCODE_DONE || trade.ResultRetcode() == TRADE_RETCODE_DONE_PARTIAL))
-    {
-        g_entries++;
+if(order_sent && (trade.ResultRetcode() == TRADE_RETCODE_DONE || trade.ResultRetcode() == TRADE_RETCODE_DONE_PARTIAL))
+{
+    g_entries++;
 
-        double rvol   = trade.ResultVolume();
-        double rprice = trade.ResultPrice();
+    double rvol   = trade.ResultVolume();
+    double rprice = trade.ResultPrice();
 
-        PrintFormat("%s HYBRID Signal:%s → Executed %.2f lots @%.5f | SL:%.5f TP:%.5f",
-                    EVT_ENTRY, g_last_side,
-                    (rvol > 0 ? rvol : g_last_vol),
-                    (rprice > 0 ? rprice : 0.0),
-                    g_last_sl, g_last_tp);
+    PrintFormat("%s HYBRID Signal:%s → Executed %.2f lots @%.5f | SL:%.5f TP:%.5f",
+                EVT_ENTRY, g_last_side,
+                (rvol > 0 ? rvol : g_last_vol),
+                (rprice > 0 ? rprice : 0.0),
+                g_last_sl, g_last_tp);
 
-        if(g_last_side == "BUY") g_last_entry_bar_buy = g_lastBarTime;
-        else                     g_last_entry_bar_sell = g_lastBarTime;
+    // >>> EXEC line to Journal (tester shows it)
+    double exec_lots = (rvol > 0.0 ? rvol : g_last_vol);
+    AAI_LogExec(g_last_side == "BUY" ? +1 : -1, exec_lots);  // optional 3rd arg: "Flow+"
 
-        // --- NEW: write EXEC|... line for the dashboard/aggregator
-        int dir = (g_last_side == "BUY" ? +1 : -1);
-        double lots_hint = (rvol > 0 ? rvol : g_last_vol);
-        AAI_LogExec(dir, lots_hint, "adhoc");
-        // -----------------------------------------------
-    }
+    // Keep these after the log
+    if(g_last_side == "BUY") g_last_entry_bar_buy = g_lastBarTime;
+    else                     g_last_entry_bar_sell = g_lastBarTime;
+}
+
     else
     {
         if(g_lastBarTime != g_last_suppress_log_time)
@@ -1674,12 +1712,22 @@ bool TryOpenPosition(int signal, double conf_raw, double conf_eff, int reason_co
       trade.SetDeviationInPoints(MaxSlippagePoints);
       bool order_sent = (signal > 0) ? trade.Buy(lots_to_trade, symbolName, 0, sl, tp, comment) : trade.Sell(lots_to_trade, symbolName, 0, sl, tp, comment);
       
-      if(order_sent && (trade.ResultRetcode() == TRADE_RETCODE_DONE || trade.ResultRetcode() == TRADE_RETCODE_DONE_PARTIAL)){
-         g_entries++;
-         PrintFormat("%s Signal:%s → Executed %.2f lots @%.5f | SL:%.5f TP:%.5f", EVT_ENTRY, signal_str, trade.ResultVolume(), trade.ResultPrice(), sl, tp);
-         if(signal > 0) g_last_entry_bar_buy = current_bar_time; else g_last_entry_bar_sell = current_bar_time;
-         return true;
-      }
+if(order_sent && (trade.ResultRetcode() == TRADE_RETCODE_DONE || trade.ResultRetcode() == TRADE_RETCODE_DONE_PARTIAL))
+{
+    g_entries++;
+    PrintFormat("%s Signal:%s → Executed %.2f lots @%.5f | SL:%.5f TP:%.5f",
+                EVT_ENTRY, signal_str, trade.ResultVolume(), trade.ResultPrice(), sl, tp);
+
+    // >>> EXEC line to Journal (tester shows it)
+    double exec_lots = (trade.ResultVolume() > 0.0 ? trade.ResultVolume() : lots_to_trade);
+    AAI_LogExec(signal > 0 ? +1 : -1, exec_lots);  // optional 3rd arg: "Flow+"
+
+    if(signal > 0) g_last_entry_bar_buy = current_bar_time;
+    else           g_last_entry_bar_sell = current_bar_time;
+
+    return true;
+}
+
       else{
          if(g_lastBarTime != g_last_suppress_log_time){
             PrintFormat("%s reason=trade_send_failed details=retcode:%d", EVT_SUPPRESS, trade.ResultRetcode());
