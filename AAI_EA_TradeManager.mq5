@@ -1,3 +1,49 @@
+
+// ====================== AAI METRICS (PF/WR/Avg/MaxDD/AvgDur) ======================
+#ifndef AAI_METRICS_DEFINED
+#define AAI_METRICS_DEFINED
+int    AAI_trades = 0;
+int    AAI_wins = 0, AAI_losses = 0;
+double AAI_gross_profit = 0.0;    // sum of positive net P&L
+double AAI_gross_loss   = 0.0;    // sum of negative net P&L (stored as positive abs)
+double AAI_sum_win      = 0.0;    // for avg win
+double AAI_sum_loss_abs = 0.0;    // for avg loss (abs)
+int    AAI_win_count = 0, AAI_loss_count = 0;
+
+double AAI_curve = 0.0;           // equity curve (closed-trade increments)
+double AAI_peak  = 0.0;           // peak of curve
+double AAI_max_dd = 0.0;          // max drawdown (abs) on closed-trade curve
+
+long   AAI_last_in_pos_id = -1;
+datetime AAI_last_in_time = 0;
+
+ulong  AAI_last_out_deal = 0;     // dedupe out deals
+ulong  AAI_last_in_deal  = 0;     // (reuses exec hook dedupe if present)
+
+// Net P&L for a deal: profit + commission + swap
+double AAI_NetDealPL(ulong deal_ticket)
+{
+   if(!HistoryDealSelect((long)deal_ticket)) return 0.0;
+   double p  = HistoryDealGetDouble(deal_ticket, DEAL_PROFIT);
+   double c  = HistoryDealGetDouble(deal_ticket, DEAL_COMMISSION);
+   double sw = HistoryDealGetDouble(deal_ticket, DEAL_SWAP);
+   return p + c + sw;
+}
+
+// Update drawdown stats on closed-trade increments
+void AAI_UpdateCurve(double net_pl)
+{
+   AAI_curve += net_pl;
+   if(AAI_curve > AAI_peak) AAI_peak = AAI_curve;
+   double dd = AAI_peak - AAI_curve;
+   if(dd > AAI_max_dd) AAI_max_dd = dd;
+}
+#endif
+
+double AAI_dur_sum_sec = 0.0;
+int    AAI_dur_count   = 0;
+
+// ==================== /AAI METRICS ======================
 //+------------------------------------------------------------------+
 //|                     AAI_EA_TradeManager.mq5                      |
 //|           v3.72 - Spread Guard Bootstrapping                     |
@@ -1076,7 +1122,22 @@ void OnTesterDeinit() { PrintSummary(); }
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   if(Hybrid_RequireApproval)
+   
+   // --- AAI END-OF-TEST SUMMARY (Journal) ---
+   double PF = (AAI_gross_loss > 0.0 ? (AAI_gross_profit / AAI_gross_loss) : (AAI_gross_profit > 0.0 ? DBL_MAX : 0.0));
+   double WR = (AAI_trades > 0 ? 100.0 * (double)AAI_wins / (double)AAI_trades : 0.0);
+   double avg_win  = (AAI_win_count  > 0 ? AAI_sum_win      / (double)AAI_win_count  : 0.0);
+   double avg_loss = (AAI_loss_count > 0 ? AAI_sum_loss_abs / (double)AAI_loss_count : 0.0);
+   double avg_dur_sec = (AAI_dur_count > 0 ? AAI_dur_sum_sec / (double)AAI_dur_count : 0.0);
+
+   // Format duration as H:MM:SS
+   int    h = (int)(avg_dur_sec / 3600.0);
+   int    m = (int)((avg_dur_sec - h*3600) / 60.0);
+   int    s = (int)(avg_dur_sec - h*3600 - m*60);
+
+   PrintFormat("AAI_METRICS|trades=%d|wins=%d|losses=%d|pf=%.2f|winrate=%.1f%%|avg_win=%.2f|avg_loss=%.2f|maxDD=%.2f|avg_dur=%02d:%02d:%02d",
+               AAI_trades, AAI_wins, AAI_losses, PF, WR, avg_win, avg_loss, AAI_max_dd, h, m, s);
+if(Hybrid_RequireApproval)
       EventKillTimer();
    PrintFormat("%s Deinitialized. Reason=%d", EVT_INIT, reason);
    PrintSummary();
@@ -1225,7 +1286,76 @@ void OnTimer()
 //+------------------------------------------------------------------+
 void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result)
 {
+   
+   // --- AAI METRICS + EXEC JOURNAL ---
    if(trans.type == TRADE_TRANSACTION_DEAL_ADD && HistoryDealSelect(trans.deal))
+   {
+      // EXEC on entry (print once)
+      if(HistoryDealGetInteger(trans.deal, DEAL_ENTRY) == DEAL_ENTRY_IN)
+      {
+         if(AAI_last_in_deal != trans.deal)
+         {
+            AAI_last_in_deal = trans.deal;
+            int  dtyp = (int)HistoryDealGetInteger(trans.deal, DEAL_TYPE);
+            int  dir  = (dtyp == DEAL_TYPE_BUY ? +1 : -1);
+            double lots = HistoryDealGetDouble(trans.deal, DEAL_VOLUME);
+            AAI_LogExec(dir, lots, "tx");
+
+            // Remember last IN time (for duration calc)
+            AAI_last_in_pos_id = (long)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+            AAI_last_in_time   = (datetime)HistoryDealGetInteger(trans.deal, DEAL_TIME);
+         }
+      }
+      // Metrics on exits (DEAL_ENTRY_OUT): accumulate closed-trade stats
+      else if(HistoryDealGetInteger(trans.deal, DEAL_ENTRY) == DEAL_ENTRY_OUT)
+      {
+         if(AAI_last_out_deal != trans.deal)
+         {
+            AAI_last_out_deal = trans.deal;
+            double net = AAI_NetDealPL(trans.deal);
+            AAI_trades++;
+            if(net > 0.0) { AAI_wins++; AAI_win_count++; AAI_gross_profit += net; AAI_sum_win += net; }
+            else if(net < 0.0) { AAI_losses++; AAI_loss_count++; AAI_gross_loss += -net; AAI_sum_loss_abs += -net; }
+
+            // Closed-trade curve & drawdown
+            AAI_UpdateCurve(net);
+
+            // Duration estimate (seconds) using last known IN time
+            datetime out_time = (datetime)HistoryDealGetInteger(trans.deal, DEAL_TIME);
+            if(AAI_last_in_time > 0 && out_time >= AAI_last_in_time)
+            {
+                AAI_dur_sum_sec += (double)(out_time - AAI_last_in_time);
+                AAI_dur_count++;
+            }
+
+            // Optional: duration estimate using last IN time if position ids align
+            long pos_id = (long)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+            // We keep a simple heuristic: if position id changed since last IN, we try to back-scan one IN for same pos_id
+            if(pos_id != AAI_last_in_pos_id)
+            {
+               // best-effort backscan for nearest IN of same position
+               int total = HistoryDealsTotal();
+               datetime nearest_in = 0;
+               for(int i = total-1; i >= 0 && i >= total-200; --i) // scan recent deals window
+               {
+                  ulong tk = (ulong)HistoryDealGetTicket(i);
+                  if(HistoryDealGetInteger(tk, DEAL_POSITION_ID) == pos_id &&
+                     HistoryDealGetInteger(tk, DEAL_ENTRY) == DEAL_ENTRY_IN)
+                  {
+                     nearest_in = (datetime)HistoryDealGetInteger(tk, DEAL_TIME);
+                     break;
+                  }
+               }
+               if(nearest_in > 0) AAI_last_in_time = nearest_in;
+            }
+
+            // Store per-trade duration (seconds) in curve via a hidden trick: we reuse AAI_peak as accumulator? No.
+            // We'll accumulate durations separately.
+            // Declare static accumulators at top of file?
+         }
+      }
+   }
+if(trans.type == TRADE_TRANSACTION_DEAL_ADD && HistoryDealSelect(trans.deal))
    {
       if((ulong)HistoryDealGetInteger(trans.deal, DEAL_MAGIC) == MagicNumber && HistoryDealGetInteger(trans.deal, DEAL_ENTRY) == DEAL_ENTRY_OUT)
       {
