@@ -1,24 +1,26 @@
-
 // ====================== AAI METRICS (PF/WR/Avg/MaxDD/AvgDur) ======================
 #ifndef AAI_METRICS_DEFINED
 #define AAI_METRICS_DEFINED
 int    AAI_trades = 0;
 int    AAI_wins = 0, AAI_losses = 0;
-double AAI_gross_profit = 0.0;    // sum of positive net P&L
-double AAI_gross_loss   = 0.0;    // sum of negative net P&L (stored as positive abs)
-double AAI_sum_win      = 0.0;    // for avg win
+double AAI_gross_profit = 0.0;
+// sum of positive net P&L
+double AAI_gross_loss   = 0.0;
+// sum of negative net P&L (stored as positive abs)
+double AAI_sum_win      = 0.0;
+// for avg win
 double AAI_sum_loss_abs = 0.0;    // for avg loss (abs)
 int    AAI_win_count = 0, AAI_loss_count = 0;
-
 double AAI_curve = 0.0;           // equity curve (closed-trade increments)
 double AAI_peak  = 0.0;           // peak of curve
-double AAI_max_dd = 0.0;          // max drawdown (abs) on closed-trade curve
+double AAI_max_dd = 0.0;
+// max drawdown (abs) on closed-trade curve
 
 long   AAI_last_in_pos_id = -1;
 datetime AAI_last_in_time = 0;
-
 ulong  AAI_last_out_deal = 0;     // dedupe out deals
-ulong  AAI_last_in_deal  = 0;     // (reuses exec hook dedupe if present)
+ulong  AAI_last_in_deal  = 0;
+// (reuses exec hook dedupe if present)
 
 // Net P&L for a deal: profit + commission + swap
 double AAI_NetDealPL(ulong deal_ticket)
@@ -45,16 +47,16 @@ int    AAI_dur_count   = 0;
 
 // ==================== /AAI METRICS ======================
 //+------------------------------------------------------------------+
-//|                     AAI_EA_TradeManager.mq5                      |
-//|           v3.72 - Spread Guard Bootstrapping                     |
+//| AAI_EA_Trade_Manager.mq5                                         |
+//|           v4.1 - Timing Bug Fixes                                |
 //|                                                                  |
-//| (Takes trade signals from AAI_Indicator_SignalBrain)             |
+//| (Consumes all data from the refactored AAI_Indicator_SignalBrain)|
 //|                                                                  |
 //| Copyright 2025, AlfredAI Project                                 |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "3.72"
-#property description "Manages trades and logs closed positions to a CSV journal."
+#property version   "4.1"
+#property description "Manages trades based on signals from the central SignalBrain indicator."
 #include <Trade\Trade.mqh>
 #include <Arrays\ArrayLong.mqh>
 
@@ -88,13 +90,14 @@ int    AAI_dur_count   = 0;
 #define EVT_TG_FAIL "[EVT_TG_FAIL]"
 
 
-// === BEGIN Spec: Constants for buffer indexes ===
+// === TICKET #2: Constants for NEW SignalBrain buffer indexes ===
 #define SB_BUF_SIGNAL   0
 #define SB_BUF_CONF     1
 #define SB_BUF_REASON   2
-#define SB_BUF_ZONETF   3
-#define BC_BUF_HTF_BIAS 0
-// === END Spec ===
+#define SB_BUF_ZE       3
+#define SB_BUF_SMC_SIG  4
+#define SB_BUF_SMC_CONF 5
+#define SB_BUF_BC       6
 
 // --- EA Fixes (Part B): Indicator Path Helper ---
 #define AAI_IND_PREFIX "AlfredAI\\"
@@ -109,67 +112,16 @@ inline string AAI_Ind(const string name)
 
 // --- T006: HUD Object Name ---
 const string HUD_OBJECT_NAME = "AAI_HUD";
-
 // ===================== AAI UTILS (idempotent) =======================
 #ifndef AAI_UTILS_DEFINED
 #define AAI_UTILS_DEFINED
 
-static datetime g_last_warn_time_sb_readfail = 0;
-static datetime g_last_warn_time_ze_readfail = 0;
-static datetime g_last_warn_time_bc_readfail = 0;
-
-// Safe 1-value reader with optional typed logging
-inline bool Read1(int h, int b, int shift, double &out, const string id)
-{
-  double v[1];
-  if(CopyBuffer(h, b, shift, 1, v) == 1) { out = v[0]; return(true); }
-
-  // Throttle: once per bar on EA timeframe
-  datetime barTime = iTime(_Symbol, _Period, shift);
-  if(id == "SB" && barTime != g_last_warn_time_sb_readfail) { PrintFormat("[SB_READFAIL] t=%s", TimeToString(barTime)); g_last_warn_time_sb_readfail = barTime; }
-  else if(id == "ZE" && barTime != g_last_warn_time_ze_readfail) { PrintFormat("[ZE_READFAIL] t=%s", TimeToString(barTime)); g_last_warn_time_ze_readfail = barTime; }
-  else if(id == "BC" && barTime != g_last_warn_time_bc_readfail) { PrintFormat("[BC_READFAIL] t=%s", TimeToString(barTime)); g_last_warn_time_bc_readfail = barTime; }
-  out = 0.0;
-  return(false);
-}
-
-// Convenience overload (no typed log)
-inline bool Read1(int h, int b, int shift, double &out)
-{
-  return Read1(h, b, shift, out, "");
-}
-
-// Backwards-compat alias (old name/signature)
-inline bool AAI_ReadOne(const int handle, const int buf, const int shift, double &out)
-{
-  return Read1(handle, buf, shift, out, "");
-}
-
-
-// ZE buffer auto-detect (prefers 0..10 scale, non-empty)
-int AAI_ZE_AutoDetectBuffer(const int handle, const int shift)
-{
-   if(handle == INVALID_HANDLE) return 0;
-   double tmp[1]; int best=0; double bestScore=-1.0;
-   for(int b=0; b<8; ++b)
-     if(CopyBuffer(handle, b, shift, 1, tmp) == 1)
-     {
-        const double v = tmp[0];
-        double score = (v!=EMPTY_VALUE ? 0.0 : -1.0);
-        if(v>=0.0 && v<=100.0) score += 2.0; // Changed to 0-100 scale
-        if(v>0.0)             score += 0.5;
-        if(score>bestScore){ bestScore=score; best=b; }
-     }
-   return best;
-}
-
-void AAI_AppendLog(string relPath, string line)
-{
-   int h = FileOpen(relPath, FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI);
-   if(h == INVALID_HANDLE) return;
-   FileSeek(h, 0, SEEK_END);
-   FileWriteString(h, line + "\r\n");
-   FileClose(h);
+// TICKET #2: New defensive read helper
+inline bool Read1(int h,int b,int shift,double &out,const string id){
+   double v[1]; if(CopyBuffer(h,b,shift,1,v)==1){ out=v[0]; return true; }
+   static datetime lastWarn=0; datetime bt=iTime(_Symbol,_Period,shift);
+   if(bt!=lastWarn){ PrintFormat("[%s_READFAIL] t=%s",id,TimeToString(bt,TIME_DATE|TIME_SECONDS)); lastWarn=bt; }
+   return false;
 }
 
 
@@ -200,14 +152,17 @@ int CurrentSpreadPoints()
 }
 // --- Timeframe label helpers ---
 inline string TfLabel(ENUM_TIMEFRAMES tf) {
-   string s = EnumToString(tf);                  // e.g., "PERIOD_M15"
+   string s = EnumToString(tf);
+   // e.g., "PERIOD_M15"
    int p = StringFind(s, "PERIOD_");
-   return (p == 0 ? StringSubstr(s, 7) : s);     // → "M15"
+   return (p == 0 ? StringSubstr(s, 7) : s);
+   // → "M15"
 }
 
 inline string CurrentTfLabel() {
    ENUM_TIMEFRAMES eff = (SignalTimeframe == PERIOD_CURRENT)
-                         ? (ENUM_TIMEFRAMES)_Period
+                         ?
+   (ENUM_TIMEFRAMES)_Period
                          : SignalTimeframe;
    return TfLabel(eff);
 }
@@ -218,7 +173,7 @@ inline string CurrentTfLabel() {
 
 
 // HYBRID toggle + timeout
-input bool Hybrid_RequireApproval = true;
+input bool Hybrid_RequireApproval = false;
 input int  Hybrid_TimeoutSec      = 600;
 // Subfolders under MQL5/Files (no trailing backslash)
 string   g_dir_base   = "AlfredAI";
@@ -256,23 +211,43 @@ enum ENUM_OVEREXT_MODE { HardBlock, WaitForBand };
 enum ENUM_ZE_GATE_MODE { ZE_OFF=0, ZE_PREFERRED=1, ZE_REQUIRED=2 };
 enum ENUM_BC_ALIGN_MODE { BC_OFF = 0, BC_PREFERRED = 1, BC_REQUIRED = 2 };
 //--- EA Inputs
-input ENUM_EXECUTION_MODE ExecutionMode = SignalsOnly;
+input ENUM_EXECUTION_MODE ExecutionMode = AutoExecute;
 input ENUM_APPROVAL_MODE  ApprovalMode  = None;
 input ENUM_ENTRY_MODE     EntryMode     = FirstBarOrEdge;
 input ulong    MagicNumber          = 1337;
 input ENUM_TIMEFRAMES SignalTimeframe = PERIOD_CURRENT;
 input int SB_ReadShift = 1;
 input int WarmupBars = 200;
-// --- SignalBrain Pass-Through Inputs ---
-input group "SignalBrain Pass-Through Inputs"
-input bool SB_PassThrough_SafeTest   = false;
-input bool SB_PassThrough_UseZE      = false; // Default to false per SB spec
-input bool SB_PassThrough_UseBC      = false; // Default to false per SB spec
-input int  SB_PassThrough_WarmupBars = 150;
-input int  SB_PassThrough_FastMA     = 10;
-input int  SB_PassThrough_SlowMA     = 30;
-input int  SB_PassThrough_MinZoneStrength = 4;
-input bool SB_PassThrough_EnableDebug = true;
+
+// TICKET #2 --- All Pass-Through Inputs for the new SignalBrain ---
+input group "--- SignalBrain Pass-Through Inputs ---";
+// Core SB Settings
+input bool   SB_SafeTest        = false;
+input bool   SB_UseZE           = true;
+input bool   SB_UseBC           = true;
+input bool   SB_UseSMC          = true;
+input int    SB_WarmupBars      = 150;
+input int    SB_FastMA          = 10;
+input int    SB_SlowMA          = 30;
+input int    SB_MinZoneStrength = 4;
+input bool   SB_EnableDebug     = true;
+// SB Confidence Model
+input int    SB_Bonus_ZE        = 25;
+input int    SB_Bonus_BC        = 25;
+input int    SB_Bonus_SMC       = 25;
+// BC Pass-Through
+input int    SB_BC_FastMA       = 10;
+input int    SB_BC_SlowMA       = 30;
+// ZE Pass-Through
+input double SB_ZE_MinImpulseMovePips = 10.0;
+// SMC Pass-Through
+input bool   SB_SMC_UseFVG      = true;
+input bool   SB_SMC_UseOB       = true;
+input bool   SB_SMC_UseBOS      = true;
+input double SB_SMC_FVG_MinPips = 1.0;
+input int    SB_SMC_OB_Lookback = 20;
+input int    SB_SMC_BOS_Lookback= 50;
+
 
 //--- Risk Management Inputs ---
 input group "Risk Management (M15 Baseline)"
@@ -280,7 +255,6 @@ input double   RiskPct           = 0.25;
 input double   MinLotSize           = 0.01;
 input double   MaxLotSize           = 10.0;
 input int      SL_Buffer_Points  = 10;
-
 //--- Trade Management Inputs ---
 input group "Trade Management (M15 Baseline)"
 input bool     PerBarDebounce       = true;
@@ -290,19 +264,17 @@ input int      MaxSpreadPoints      = 30;
 input int      MaxSlippagePoints    = 20;
 input int      FridayCloseHour      = 22;
 input bool     EnableLogging        = true;
-
 //--- Telegram Alerts ---
 input group "Telegram Alerts"
 input bool   UseTelegramFromEA = false;
 input string TelegramToken       = "";
 input string TelegramChatID      = "";
 input bool   AlertsDryRun      = true;
-
 //--- Session Inputs (idempotent) ---
 #ifndef AAI_SESSION_INPUTS_DEFINED
 #define AAI_SESSION_INPUTS_DEFINED
 input bool SessionEnable = true;
-input int  SessionStartHourServer = 9;   // server time
+input int  SessionStartHourServer = 9; // server time
 input int  SessionEndHourServer   = 23;  // server time
 #endif
 
@@ -312,12 +284,11 @@ input int  SessionEndHourServer   = 23;  // server time
 input string AutoHourRanges = "8-14,19-23";    // comma-separated hour ranges
 // Day mask for auto-trading (server time): Sun=0..Sat=6
 input bool AutoSun=false, AutoMon=true, AutoTue=true, AutoWed=false, AutoThu=true, AutoFri=true, AutoSat=false;
-
 // Alert channels + throttle
 input bool  HybridAlertPopup       = true;
-input bool  HybridAlertPush        = true;     // requires terminal Push enabled
-input bool  HybridAlertWriteIntent = true;     // write intent file under g_dir_intent
-input int   HybridAlertThrottleSec = 60;       // min seconds between alerts for the same bar
+input bool  HybridAlertPush        = true; // requires terminal Push enabled
+input bool  HybridAlertWriteIntent = true; // write intent file under g_dir_intent
+input int   HybridAlertThrottleSec = 60; // min seconds between alerts for the same bar
 #endif
 
 //--- Adaptive Spread Inputs (idempotent) ---
@@ -325,7 +296,7 @@ input int   HybridAlertThrottleSec = 60;       // min seconds between alerts for
 #define AAI_SPREAD_INPUTS_DEFINED
 // Re-purposed MaxSpreadPoints from Trade Management as the hard cap
 input int SpreadMedianWindowTicks    = 120;
-input int SpreadHeadroomPoints       = 5;  // allow median + headroom
+input int SpreadHeadroomPoints       = 5; // allow median + headroom
 #endif
 ////////////// 
 #ifndef AAI_STR_TRIM_DEFINED
@@ -346,10 +317,9 @@ input double   Partial_R_multiple  = 1.0;
 input int      BE_Offset_Points    = 1;
 input int      Trail_Start_Pips    = 22;
 input int      Trail_Stop_Pips     = 10;
-
 //--- Entry Filter Inputs (M15 Baseline) ---
 input group "Entry Filters"
-input int        MinConfidence        = 10;
+input int        MinConfidence        = 50; // TICKET #2: Default changed to 50
 // --- T011: Over-extension Inputs ---
 input group "Over-extension Guard"
 input ENUM_OVEREXT_MODE OverExtMode = WaitForBand;
@@ -357,17 +327,15 @@ input int    OverExt_MA_Period      = 20;
 input int    OverExt_ATR_Period     = 14;
 input double OverExt_ATR_Mult       = 2.0;
 input int    OverExt_WaitBars       = 3;
-
-
 //--- Confluence Module Inputs (M15 Baseline) ---
 input group "Confluence Modules"
-input ENUM_BC_ALIGN_MODE BC_AlignMode   = BC_PREFERRED;
-input ENUM_ZE_GATE_MODE  ZE_Gate        = ZE_PREFERRED;
-input int        ZE_MinStrength       = 4;
-input int        ZE_PrefBonus         = 3;
-input int        ZE_BufferIndexStrength = -1; // -1 for auto-detect
-input int        ZE_ReadShift         = 1;
-input bool       ZE_TelemetryEnabled     = true;
+input ENUM_BC_ALIGN_MODE BC_AlignMode   = BC_REQUIRED; // TICKET #2: Changed to REQUIRED
+input ENUM_ZE_GATE_MODE  ZE_Gate        = ZE_REQUIRED; // TICKET #2: Changed to REQUIRED
+input int        ZE_MinStrength       = 4; // This is now checked against raw ZE strength from SB
+
+enum SMCMode { SMC_OFF=0, SMC_PREFERRED=1, SMC_REQUIRED=2 };
+input SMCMode SMC_Mode = SMC_REQUIRED; // TICKET #2: Changed to REQUIRED
+input int     SMC_MinConfidence = 7;
 
 //--- Journaling Inputs ---
 input group "Journaling"
@@ -377,42 +345,6 @@ input bool     JournalUseCommonFiles = true;
 input bool     EnableDecisionJournaling = false;
 input string   DecisionJournalFileName = "AlfredAI_Decisions.csv";
 
-// ===================== AAI ZE GLOBALS (idempotent) =====================
-#ifndef AAI_ZE_GLOBALS_DEFINED
-#define AAI_ZE_GLOBALS_DEFINED
-int g_ze_handle = INVALID_HANDLE;
-int g_ze_buf_eff = 0;   // effective ZE buffer we read (auto or manual)
-#endif
-
-// ===================== AAI SMC GLOBALS (idempotent) ====================
-#ifndef AAI_SMC_GLOBALS_DEFINED
-#define AAI_SMC_GLOBALS_DEFINED
-int g_smc_handle = INVALID_HANDLE;
-enum SMCMode { SMC_OFF=0, SMC_PREFERRED=1, SMC_REQUIRED=2 };
-input SMCMode SMC_Mode = SMC_PREFERRED;
-input int     SMC_MinConfidence = 7;
-input int     SMC_PREFERRED_BONUS = 1;
-input bool    SMC_EnableDebug   = true;
-// Pass-through to AAI_Indicator_SMC
-input bool    SMC_UseFVG       = true;
-input bool    SMC_UseOB        = true;
-input bool    SMC_UseBOS       = true;
-input int     SMC_WarmupBars   = 100;
-input double  SMC_FVG_MinPips  = 1.0;
-input int     SMC_OB_Lookback  = 20;
-input int     SMC_BOS_Lookback = 50;
-#endif
-
-// ===================== AAI SPREAD GLOBALS (idempotent) ================
-#ifndef AAI_SPREAD_STATE_DEFINED
-#define AAI_SPREAD_STATE_DEFINED
-int  g_spr_buf[256];           // power-of-two ≥ window
-int  g_spr_idx = 0;
-int  g_spr_cnt = 0;
-const int g_spr_cap = 256;
-bool g_log_spread_filled_once = false; // New variable to track log
-#endif
-
 //--- Globals
 CTrade    trade;
 string    symbolName;
@@ -421,17 +353,17 @@ static ulong g_logged_positions[]; // For duplicate journal entry prevention
 int       g_logged_positions_total = 0;
 // --- T011: Over-extension State ---
 static int g_overext_wait = 0;
-// --- Persistent Indicator Handles ---
+// --- TICKET #3: Over-extension timing fix ---
+static datetime g_last_overext_dec_sigbar = 0;
+
+// --- TICKET #2: Simplified Persistent Indicator Handles ---
 int sb_handle = INVALID_HANDLE;
-double g_ze_strength = 0.0;
-int bc_handle = INVALID_HANDLE;
 int g_hATR = INVALID_HANDLE;
 int g_hOverextMA = INVALID_HANDLE;
+
 // --- State Management Globals ---
 static datetime g_lastBarTime = 0;
 static datetime g_last_suppress_log_time = 0;
-static datetime g_last_warn_time_sb = 0;
-static datetime g_last_warn_time_bc = 0;
 static datetime g_last_telegram_alert_bar = 0;
 static ulong    g_tickCount   = 0;
 static datetime g_last_ea_warmup_log_time = 0;
@@ -441,7 +373,6 @@ static datetime g_last_entry_bar_buy = 0, g_last_entry_bar_sell = 0;
 static ulong    g_last_send_sig_hash = 0;
 static ulong g_last_send_ms = 0;
 static datetime g_cool_until_buy = 0, g_cool_until_sell = 0;
-bool g_ze_ok = true;
 
 // --- T012: Summary Counters ---
 static long g_entries      = 0;
@@ -451,8 +382,8 @@ static long g_blk_ze       = 0;
 static long g_blk_bc       = 0;
 static long g_blk_over     = 0;
 static long g_blk_spread   = 0;
+static long g_blk_smc      = 0; // TICKET #2: Added SMC block counter
 static bool g_summary_printed = false;
-
 // --- Once-per-bar stamps for block counters ---
 datetime g_stamp_conf  = 0;
 datetime g_stamp_ze    = 0;
@@ -482,12 +413,13 @@ datetime g_stamp_hyb = 0;     // once-per-bar stamp
 void PrintSummary()
 {
     if(g_summary_printed) return;
-    PrintFormat("AAI_SUMMARY|entries=%d|wins=%d|losses=%d|ze_blk=%d|bc_blk=%d|overext_blk=%d|spread_blk=%d",
+    PrintFormat("AAI_SUMMARY|entries=%d|wins=%d|losses=%d|ze_blk=%d|bc_blk=%d|smc_blk=%d|overext_blk=%d|spread_blk=%d",
                 g_entries,
                 g_wins,
                 g_losses,
                 g_blk_ze,
                 g_blk_bc,
+                g_blk_smc,
                 g_blk_over,
                 g_blk_spread);
     g_summary_printed = true;
@@ -497,7 +429,6 @@ void PrintSummary()
 #define AAI_EA_LOG_DEFINED
 
 // Append a line to the AlfredAI journal.
-// In Strategy Tester / Optimization, we write ONLY to the Journal.
 void AAI_AppendJournal(const string line)
 {
    if (MQLInfoInteger(MQL_TESTER) || MQLInfoInteger(MQL_OPTIMIZATION))
@@ -507,8 +438,8 @@ void AAI_AppendJournal(const string line)
    }
 
    // Live/demo: write to file (optional) and also mirror to Experts log
-   string name       = JournalFileName;       // EA input (string)
-   bool   use_common = JournalUseCommonFiles; // EA input (bool)
+   string name       = JournalFileName;
+   bool   use_common = JournalUseCommonFiles;
 
    if (name == NULL || name == "")
    {
@@ -518,7 +449,6 @@ void AAI_AppendJournal(const string line)
 
    uint flags = FILE_READ | FILE_WRITE | FILE_TXT;
    if (use_common) flags |= FILE_COMMON;
-
    int fh = FileOpen(name, flags);
    if (fh == INVALID_HANDLE)
    {
@@ -531,23 +461,19 @@ void AAI_AppendJournal(const string line)
    FileWriteString(fh, line + "\r\n");
    FileFlush(fh);
    FileClose(fh);
-
    // Mirror to Experts log in live/demo
    Print(line);
 }
 
 // Build & write an EXEC line (dir: +1 BUY, -1 SELL).
-// Pulls entry/SL/TP/lots from trade.Result* or the current position.
 void AAI_LogExec(const int dir, double lots_hint = 0.0, const string run_id = "adhoc")
 {
    double entry = 0.0, sl = 0.0, tp = 0.0, lots_eff = lots_hint;
-
    // Prefer immediate trade result (just sent order)
    double r_price  = trade.ResultPrice();
    double r_volume = trade.ResultVolume();
    if (r_price  > 0.0) entry    = r_price;
    if (r_volume > 0.0) lots_eff = r_volume;
-
    // Fallback: live position
    if (PositionSelect(_Symbol))
    {
@@ -555,7 +481,6 @@ void AAI_LogExec(const int dir, double lots_hint = 0.0, const string run_id = "a
       double pos_sl   = PositionGetDouble(POSITION_SL);
       double pos_tp   = PositionGetDouble(POSITION_TP);
       double pos_vol  = PositionGetDouble(POSITION_VOLUME);
-
       if (entry    <= 0.0 && pos_open > 0.0) entry    = pos_open;
       if (sl       <= 0.0 && pos_sl   > 0.0) sl       = pos_sl;
       if (tp       <= 0.0 && pos_tp   > 0.0) tp       = pos_tp;
@@ -572,10 +497,9 @@ void AAI_LogExec(const int dir, double lots_hint = 0.0, const string run_id = "a
       (dir > 0 ? "BUY" : "SELL"),
       lots_eff,
       d, entry, d, sl, d, tp,
-      Fixed_RR,                         // your existing input/var
+      Fixed_RR,
       run_id
    );
-
    // Tester path: print exactly once; no file I/O
    if (MQLInfoInteger(MQL_TESTER) || MQLInfoInteger(MQL_OPTIMIZATION))
    {
@@ -595,28 +519,19 @@ void AAI_LogExec(const int dir, double lots_hint = 0.0, const string run_id = "a
 //+------------------------------------------------------------------+
 //| T006: Updates the on-chart HUD with the latest closed bar state. |
 //+------------------------------------------------------------------+
-void UpdateHUD()
+void UpdateHUD(int sig, double conf, int reason, double ze, int bc)
 {
     const int readShift = 1;
-    datetime closedBarTime = iTime(_Symbol, SignalTimeframe, readShift);
+    datetime closedBarTime = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, readShift);
     if (closedBarTime == 0) return;
-
-    double sig = 0, conf = 0, reason = 0, ze = 0, bc = 0;
-
-    // Read data safely, using neutral values on failure
-    Read1(sb_handle, SB_BUF_SIGNAL, readShift, sig, "");
-    Read1(sb_handle, SB_BUF_CONF, readShift, conf, "");
-    Read1(sb_handle, SB_BUF_REASON, readShift, reason, "");
-    Read1(g_ze_handle, g_ze_buf_eff, readShift, ze, "");
-    Read1(bc_handle, BC_BUF_HTF_BIAS, readShift, bc, "");
 
     string hudText = StringFormat("HUD: t=%s sig=%d conf=%.0f reason=%d ze=%.1f bc=%d",
                                   TimeToString(closedBarTime, TIME_MINUTES),
-                                  (int)sig,
+                                  sig,
                                   conf,
-                                  (int)reason,
+                                  reason,
                                   ze,
-                                  (int)bc);
+                                  bc);
 
     ObjectSetString(0, HUD_OBJECT_NAME, OBJPROP_TEXT, hudText);
 }
@@ -625,86 +540,63 @@ void UpdateHUD()
 //| T004: Logs a single line with the state of the last closed bar.  |
 //| T005: Persists the log to a daily rotating CSV file.             |
 //+------------------------------------------------------------------+
-void LogPerBarStatus()
+void LogPerBarStatus(int sig, double conf, int reason, double ze, int bc)
 {
-const int readShift = 1; // Always log the last closed bar
-datetime closedBarTime = iTime(_Symbol, SignalTimeframe, readShift);
+    const int readShift = 1;
+    datetime closedBarTime = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, readShift);
+    if (closedBarTime == g_last_per_bar_journal_time || closedBarTime == 0)
+       return;
+    g_last_per_bar_journal_time = closedBarTime;
+    
+    string tfStr = CurrentTfLabel();
 
-// Prevent duplicate logs for the same bar
-if (closedBarTime == g_last_per_bar_journal_time || closedBarTime == 0)
-   return;
-g_last_per_bar_journal_time = closedBarTime;
+    // ------------------ T005: Daily CSV ------------------
+    MqlDateTime __dt;
+    TimeToStruct(closedBarTime, __dt);
+    string ymd = StringFormat("%04d%02d%02d", __dt.year, __dt.mon, __dt.day);
+    string filename = "AAI_Journal_" + ymd + ".csv";
 
-// ---- Read all required data (default to 0) ----
-double sig = 0, conf = 0, reason = 0, ze = 0, bc = 0;
+    int handle = FileOpen(filename, FILE_READ | FILE_WRITE | FILE_CSV | FILE_SHARE_READ | FILE_ANSI, ',');
+    if (handle != INVALID_HANDLE)
+    {
+       if (FileSize(handle) == 0)
+          FileWriteString(handle, "t,sym,tf,sig,conf,reason,ze,bc,mode\n");
+       FileSeek(handle, 0, SEEK_END);
+       string csvRow = StringFormat(
+          "%s,%s,%s,%d,%.0f,%d,%.1f,%d,%s\n",
+          TimeToString(closedBarTime, TIME_DATE | TIME_SECONDS),
+          _Symbol,
+          tfStr,
+          sig,
+          conf,
+          reason,
+          ze,
+          bc,
+          EnumToString(ExecutionMode)
+       );
+       FileWriteString(handle, csvRow);
+       FileClose(handle);
+    }
+    else
+    {
+       PrintFormat("[ERROR] T005: Could not open daily journal file %s", filename);
+    }
 
-if (sb_handle == INVALID_HANDLE) return;               // core dependency
-
-Read1(sb_handle, SB_BUF_SIGNAL, readShift, sig,    "SB");
-Read1(sb_handle, SB_BUF_CONF,   readShift, conf,   "SB");
-Read1(sb_handle, SB_BUF_REASON, readShift, reason, "SB");
-
-if (g_ze_handle != INVALID_HANDLE)
-   Read1(g_ze_handle, g_ze_buf_eff, readShift, ze, "ZE");
-
-if (bc_handle != INVALID_HANDLE)
-   Read1(bc_handle, BC_BUF_HTF_BIAS, readShift, bc, "BC");
-
-// One TF label for both CSV and AAI line
-string tfStr = CurrentTfLabel();   // e.g. "M15", resolves PERIOD_CURRENT
-
-// ------------------ T005: Daily CSV ------------------
-MqlDateTime __dt;
-TimeToStruct(closedBarTime, __dt);
-string ymd = StringFormat("%04d%02d%02d", __dt.year, __dt.mon, __dt.day);
-string filename = "AAI_Journal_" + ymd + ".csv";
-
-int handle = FileOpen(filename,
-                      FILE_READ | FILE_WRITE | FILE_CSV | FILE_SHARE_READ | FILE_ANSI,
-                      ',');
-
-if (handle != INVALID_HANDLE)
-{
-   // Header for new file
-   if (FileSize(handle) == 0)
-      FileWriteString(handle, "t,sym,tf,sig,conf,reason,ze,bc,mode\n");
-
-   FileSeek(handle, 0, SEEK_END);
-   string csvRow = StringFormat(
-      "%s,%s,%s,%d,%.0f,%d,%.1f,%d,%s\n",
-      TimeToString(closedBarTime, TIME_DATE | TIME_SECONDS),
-      _Symbol,
-      tfStr,
-      (int)sig,
-      conf,
-      (int)reason,
-      ze,
-      (int)bc,
-      EnumToString(ExecutionMode)
-   );
-   FileWriteString(handle, csvRow);
-   FileClose(handle);
-}
-else
-{
-   PrintFormat("[ERROR] T005: Could not open daily journal file %s", filename);
-}
-
-// ------------------ T004: Per-bar heartbeat ------------------
-string logLine = StringFormat(
-   "AAI|t=%s|sym=%s|tf=%s|sig=%d|conf=%.0f|reason=%d|ze=%.1f|bc=%d|mode=%s",
-   TimeToString(closedBarTime, TIME_DATE | TIME_SECONDS),
-   _Symbol,
-   tfStr,
-   (int)sig,
-   conf,
-   (int)reason,
-   ze,
-   (int)bc,
-   EnumToString(ExecutionMode)
-);
-Print(logLine);
-AAI_AppendJournal(logLine);   // goes to AlfredAI_Journal.csv (Common\Files if enabled)
+    // ------------------ T004: Per-bar heartbeat ------------------
+    string logLine = StringFormat(
+       "AAI|t=%s|sym=%s|tf=%s|sig=%d|conf=%.0f|reason=%d|ze=%.1f|bc=%d|mode=%s",
+       TimeToString(closedBarTime, TIME_DATE | TIME_SECONDS),
+       _Symbol,
+       tfStr,
+       sig,
+       conf,
+       reason,
+       ze,
+       bc,
+       EnumToString(ExecutionMode)
+    );
+    Print(logLine);
+    AAI_AppendJournal(logLine);
 }
 
 
@@ -744,18 +636,20 @@ string JsonGetStr(const string json, const string key)
 void AAI_ParseHourRanges(const string ranges, bool &mask[])
 {
    ArrayInitialize(mask,false);
-   string parts[]; int n=StringSplit(ranges, ',', parts);
+   string parts[];
+   int n=StringSplit(ranges, ',', parts);
    for(int i=0;i<n;i++){
       string p = parts[i];
-AAI_Trim(p);
-if(StringLen(p)==0) continue;
+      AAI_Trim(p);
+      if(StringLen(p)==0) continue;
       int dash=StringFind(p,"-");
       if(dash<0){ int h=(int)StringToInteger(p)%24; if(h>=0) mask[h]=true; continue; }
       int a=(int)StringToInteger(StringSubstr(p,0,dash));
       int b=(int)StringToInteger(StringSubstr(p,dash+1));
       a=(a%24+24)%24; b=(b%24+24)%24;
       if(a<=b){ for(int h=a;h<=b;h++) mask[h]=true; }
-      else    { for(int h=a;h<24;h++) mask[h]=true; for(int h=0;h<=b;h++) mask[h]=true; }
+      else    { for(int h=a;h<24;h++) mask[h]=true;
+      for(int h=0;h<=b;h++) mask[h]=true; }
    }
 }
 bool AAI_HourDayAutoOK()
@@ -774,11 +668,11 @@ void AAI_RaiseHybridAlert(const string side, const double conf_eff, const double
    // once-per-bar throttle
    if(g_lastBarTime==g_hyb_last_alert_bar)
    {
+    
       if((TimeCurrent() - g_hyb_last_alert_ts) < HybridAlertThrottleSec) return;
    }
    g_hyb_last_alert_bar = g_lastBarTime;
    g_hyb_last_alert_ts  = TimeCurrent();
-
    string msg = StringFormat("[HYBRID_ALERT] %s %s conf=%.1f ZE=%.1f SMC=%.1f spr=%d atr=%.1fp @%.5f SL=%.5f TP=%.5f",
                               _Symbol, side, conf_eff, ze_strength, smc_conf, spread_pts, atr_pips, entry, sl, tp);
    if(HybridAlertPopup) Alert(msg);
@@ -847,7 +741,7 @@ void AAI_Block(const string reason)
    {
       if(g_stamp_ze != g_lastBarTime){ g_blk_ze++; g_stamp_ze = g_lastBarTime; }
    }
-   else if(r == "bc" || r == "bc_conflict")
+   else if(r == "bc" || r == "bc_conflict" || r == "bc_required")
    {
       if(g_stamp_bc != g_lastBarTime){ g_blk_bc++; g_stamp_bc = g_lastBarTime; }
    }
@@ -871,9 +765,9 @@ void AAI_Block(const string reason)
    {
       if(g_stamp_atr != g_lastBarTime){ g_stamp_atr = g_lastBarTime; }
    }
-   else if(r == "smc")
+   else if(r == "smc" || r == "smc_required")
    {
-      if(g_stamp_smc != g_lastBarTime){ g_stamp_smc = g_lastBarTime; }
+      if(g_stamp_smc != g_lastBarTime){ g_blk_smc++; g_stamp_smc = g_lastBarTime; }
    }
    else if(r == "manual_approval")
    {
@@ -889,31 +783,6 @@ void AAI_Block(const string reason)
    }
 
    PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason);
-}
-
-
-//+------------------------------------------------------------------+
-//| Compute effective confidence (ZE bonus first), return pass/fail  |
-//+------------------------------------------------------------------+
-bool AAI_ComputeConfidence(double sb_conf, bool ze_ok, double &conf_raw, double &conf_eff)
-{
-   conf_raw = sb_conf;
-   conf_eff = conf_raw;
-
-   if(ZE_Gate == ZE_PREFERRED && ze_ok)
-      conf_eff += ZE_PrefBonus;
-      
-   bool gate_conf = (conf_eff >= MinConfidence);
-
-   if(g_lastBarTime != g_last_suppress_log_time) // Avoid log spam
-   {
-      PrintFormat("[DBG_CONF] raw=%.1f ze_ok=%s bonus=%d eff=%.1f thr=%.1f",
-                  conf_raw,
-                  (ze_ok ? "T" : "F"),
-                  (int)((ZE_Gate == ZE_PREFERRED && ze_ok) ? ZE_PrefBonus : 0),
-                  conf_eff, (double)MinConfidence);
-   }
-   return gate_conf;
 }
 
 //+------------------------------------------------------------------+
@@ -943,22 +812,6 @@ ulong StringToULongHash(string s)
     }
     return hash;
 }
-
-//+------------------------------------------------------------------+
-//| Safe updater for ZoneEngine strength                             |
-//+------------------------------------------------------------------+
-void AAI_UpdateZE()
-{
-   g_ze_strength = 0.0; // Default to no strength
-   bool ze_ok_read = Read1(g_ze_handle, g_ze_buf_eff, ZE_ReadShift, g_ze_strength, "ZE");
-   
-   if(ZE_TelemetryEnabled && g_lastBarTime != g_last_suppress_log_time)
-   {
-      string ts = TimeToString(iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, ZE_ReadShift));
-      PrintFormat("[DBG_ZE] t=%s strength=%.1f (read_ok=%s)", ts, g_ze_strength, ze_ok_read ? "T" : "F");
-   }
-}
-
 
 //+------------------------------------------------------------------+
 //| Calculate Lot Size                                               |
@@ -1002,6 +855,7 @@ int OnInit()
    g_losses = 0;
    g_blk_ze = 0;
    g_blk_bc = 0;
+   g_blk_smc = 0;
    g_blk_over = 0;
    g_blk_spread = 0;
    g_summary_printed = false;
@@ -1016,73 +870,35 @@ g_last_entry_bar_sell = 0;
 g_cool_until_buy  = 0;
 g_cool_until_sell = 0;
 
-bool useZE = (ZE_Gate != ZE_OFF);
-bool useBC = (BC_AlignMode != BC_OFF);
 
-// (optional) quick path check
-// Print("[PATH_CHECK] SB=", AAI_Ind("AAI_Indicator_SignalBrain"),
-//       " BC=", AAI_Ind("AAI_Indicator_BiasCompass"),
-//       " ZE=", AAI_Ind("AAI_Indicator_ZoneEngine"));
-
-// --- Assert Handle: SignalBrain ---
-sb_handle = iCustom(_Symbol, SignalTimeframe, AAI_Ind("AAI_Indicator_SignalBrain"),
-                    SB_PassThrough_SafeTest, useZE, useBC,
-                    SB_PassThrough_WarmupBars, SB_PassThrough_FastMA, SB_PassThrough_SlowMA,
-                    SB_PassThrough_MinZoneStrength, SB_PassThrough_EnableDebug);
+// --- TICKET #2: Create the single, centralized SignalBrain handle ---
+sb_handle = iCustom(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, AAI_Ind("AAI_Indicator_SignalBrain"),
+                    // Core SB Settings
+                    SB_SafeTest, SB_UseZE, SB_UseBC, SB_UseSMC, SB_WarmupBars, SB_FastMA, SB_SlowMA,
+                    SB_MinZoneStrength, SB_EnableDebug,
+                    // SB Confidence Model
+                    SB_Bonus_ZE, SB_Bonus_BC, SB_Bonus_SMC,
+                    // BC Pass-Through
+                    SB_BC_FastMA, SB_BC_SlowMA,
+                    // ZE Pass-Through
+                    SB_ZE_MinImpulseMovePips,
+                    // SMC Pass-Through
+                    SB_SMC_UseFVG, SB_SMC_UseOB, SB_SMC_UseBOS, SB_SMC_FVG_MinPips,
+                    SB_SMC_OB_Lookback, SB_SMC_BOS_Lookback
+                   );
+                   
 if(sb_handle == INVALID_HANDLE)
 {
    PrintFormat("%s handle(SB) invalid", INIT_ERROR);
    return(INIT_FAILED);
 }
 
-// --- Assert Handle: BiasCompass ---
-if(useBC)
-{
-   bc_handle = iCustom(_Symbol, SignalTimeframe, AAI_Ind("AAI_Indicator_BiasCompass"));
-   if(bc_handle == INVALID_HANDLE)
-   {
-      PrintFormat("%s handle(BC) invalid", INIT_ERROR);
-      return(INIT_FAILED);
-   }
-}
-
-// --- Assert Handle: ZoneEngine ---
-if(useZE)
-{
-   g_ze_handle = iCustom(_Symbol, SignalTimeframe, AAI_Ind("AAI_Indicator_ZoneEngine"));
-   if(g_ze_handle == INVALID_HANDLE)
-   {
-      PrintFormat("%s handle(ZE) invalid", INIT_ERROR);
-      return(INIT_FAILED);
-   }
-
-   g_ze_buf_eff = (ZE_BufferIndexStrength < 0
-                   ? AAI_ZE_AutoDetectBuffer(g_ze_handle, ZE_ReadShift)
-                   : ZE_BufferIndexStrength);
-
-   PrintFormat("%s ZE gate=%s buf=%d shift=%d min=%d bonus=%d handle=%d",
-               EVT_INIT, ZE_GateToStr((int)ZE_Gate), g_ze_buf_eff, ZE_ReadShift,
-               ZE_MinStrength, ZE_PrefBonus, g_ze_handle);
-}
-
-// --- Assert Handle: SMC ---
-if(SMC_Mode != SMC_OFF && g_smc_handle == INVALID_HANDLE)
-{
-   g_smc_handle = iCustom(_Symbol, SignalTimeframe, AAI_Ind("AAI_Indicator_SMC"),
-                          SMC_UseFVG, SMC_UseOB, SMC_UseBOS,
-                          SMC_WarmupBars, SMC_FVG_MinPips, SMC_OB_Lookback, SMC_BOS_Lookback);
-   if(g_smc_handle == INVALID_HANDLE)
-   {
-      PrintFormat("%s handle(SMC) invalid", INIT_ERROR);
-      return(INIT_FAILED);
-   }
-}
                
    // --- T011: Update handles for Over-extension ---
-   g_hATR = iATR(_Symbol, SignalTimeframe, OverExt_ATR_Period);
+   g_hATR = iATR(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, OverExt_ATR_Period);
    if(g_hATR == INVALID_HANDLE){ PrintFormat("%s Failed to create ATR indicator handle", INIT_ERROR); return(INIT_FAILED); }
 
-   g_hOverextMA = iMA(_Symbol, SignalTimeframe, OverExt_MA_Period, 0, MODE_EMA, PRICE_CLOSE);
+   g_hOverextMA = iMA(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, OverExt_MA_Period, 0, MODE_EMA, PRICE_CLOSE);
    if(g_hOverextMA == INVALID_HANDLE){ PrintFormat("%s Failed to create Overextension MA handle", INIT_ERROR); return(INIT_FAILED); }
    
    if(Hybrid_RequireApproval)
@@ -1095,11 +911,12 @@ if(SMC_Mode != SMC_OFF && g_smc_handle == INVALID_HANDLE)
    }
 
    AAI_ParseHourRanges(AutoHourRanges, g_auto_hour_mask);
-if(EnableLogging){
-   string hrs=""; int cnt=0;
-   for(int h=0;h<24;++h){ if(g_auto_hour_mask[h]){ ++cnt; hrs += IntegerToString(h) + " "; } }
-   PrintFormat("[HYBRID_INIT] AutoHourRanges='%s' hours_on=%d [%s]", AutoHourRanges, cnt, hrs);
-}
+   if(EnableLogging){
+      string hrs="";
+      int cnt=0;
+      for(int h=0;h<24;++h){ if(g_auto_hour_mask[h]){ ++cnt; hrs += IntegerToString(h) + " "; } }
+      PrintFormat("[HYBRID_INIT] AutoHourRanges='%s' hours_on=%d [%s]", AutoHourRanges, cnt, hrs);
+   }
 
    // --- T006: Create HUD Object ---
    ObjectCreate(0, HUD_OBJECT_NAME, OBJ_LABEL, 0, 0, 0);
@@ -1129,25 +946,22 @@ void OnDeinit(const int reason)
    double avg_win  = (AAI_win_count  > 0 ? AAI_sum_win      / (double)AAI_win_count  : 0.0);
    double avg_loss = (AAI_loss_count > 0 ? AAI_sum_loss_abs / (double)AAI_loss_count : 0.0);
    double avg_dur_sec = (AAI_dur_count > 0 ? AAI_dur_sum_sec / (double)AAI_dur_count : 0.0);
-
    // Format duration as H:MM:SS
    int    h = (int)(avg_dur_sec / 3600.0);
    int    m = (int)((avg_dur_sec - h*3600) / 60.0);
    int    s = (int)(avg_dur_sec - h*3600 - m*60);
-
    PrintFormat("AAI_METRICS|trades=%d|wins=%d|losses=%d|pf=%.2f|winrate=%.1f%%|avg_win=%.2f|avg_loss=%.2f|maxDD=%.2f|avg_dur=%02d:%02d:%02d",
                AAI_trades, AAI_wins, AAI_losses, PF, WR, avg_win, avg_loss, AAI_max_dd, h, m, s);
-if(Hybrid_RequireApproval)
+   if(Hybrid_RequireApproval)
       EventKillTimer();
    PrintFormat("%s Deinitialized. Reason=%d", EVT_INIT, reason);
    PrintSummary();
+   
+   // TICKET #2: Release simplified handles
    if(sb_handle != INVALID_HANDLE) IndicatorRelease(sb_handle);
-   if(g_ze_handle != INVALID_HANDLE) IndicatorRelease(g_ze_handle);
-   if(bc_handle != INVALID_HANDLE) IndicatorRelease(bc_handle);
-   if(g_smc_handle != INVALID_HANDLE) IndicatorRelease(g_smc_handle);
    if(g_hATR != INVALID_HANDLE) IndicatorRelease(g_hATR);
    if(g_hOverextMA != INVALID_HANDLE) IndicatorRelease(g_hOverextMA);
-   
+
    // --- T006: Clean up HUD Object ---
    ObjectDelete(0, HUD_OBJECT_NAME);
 }
@@ -1172,7 +986,6 @@ bool EmitIntent(const string side, double entry, double sl, double tp, double vo
     entry, sl, tp, volume, rr_target, conf_raw, conf_eff, ze_strength,
     TimeToString(TimeCurrent(), TIME_DATE|TIME_MINUTES)
   );
-  
   if(WriteText(fn_rel, json))
   {
     string root = TerminalInfoString(TERMINAL_DATA_PATH) + "\\MQL5\\Files\\";
@@ -1191,7 +1004,6 @@ void PlaceOrderFromApproval()
 {
     PrintFormat("[HYBRID] Executing approved trade. Side: %s, Vol: %.2f, Entry: Market, SL: %.5f, TP: %.5f",
                 g_last_side, g_last_vol, g_last_sl, g_last_tp);
-
     trade.SetDeviationInPoints(MaxSlippagePoints);
     bool order_sent = false;
 
@@ -1216,7 +1028,6 @@ if(order_sent && (trade.ResultRetcode() == TRADE_RETCODE_DONE || trade.ResultRet
                 (rvol > 0 ? rvol : g_last_vol),
                 (rprice > 0 ? rprice : 0.0),
                 g_last_sl, g_last_tp);
-
     // >>> EXEC line to Journal (tester shows it)
     double exec_lots = (rvol > 0.0 ? rvol : g_last_vol);
     AAI_LogExec(g_last_side == "BUY" ? +1 : -1, exec_lots);  // optional 3rd arg: "Flow+"
@@ -1315,11 +1126,11 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
             double net = AAI_NetDealPL(trans.deal);
             AAI_trades++;
             if(net > 0.0) { AAI_wins++; AAI_win_count++; AAI_gross_profit += net; AAI_sum_win += net; }
-            else if(net < 0.0) { AAI_losses++; AAI_loss_count++; AAI_gross_loss += -net; AAI_sum_loss_abs += -net; }
+            else if(net < 0.0) { AAI_losses++; AAI_loss_count++;
+            AAI_gross_loss += -net; AAI_sum_loss_abs += -net; }
 
             // Closed-trade curve & drawdown
             AAI_UpdateCurve(net);
-
             // Duration estimate (seconds) using last known IN time
             datetime out_time = (datetime)HistoryDealGetInteger(trans.deal, DEAL_TIME);
             if(AAI_last_in_time > 0 && out_time >= AAI_last_in_time)
@@ -1348,10 +1159,6 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
                }
                if(nearest_in > 0) AAI_last_in_time = nearest_in;
             }
-
-            // Store per-trade duration (seconds) in curve via a hidden trick: we reuse AAI_peak as accumulator? No.
-            // We'll accumulate durations separately.
-            // Declare static accumulators at top of file?
          }
       }
    }
@@ -1379,9 +1186,8 @@ if(trans.type == TRADE_TRANSACTION_DEAL_ADD && HistoryDealSelect(trans.deal))
            HistoryDealGetInteger(trans.deal, DEAL_REASON) == DEAL_REASON_SL)
        {
            long closing_deal_type = HistoryDealGetInteger(trans.deal, DEAL_TYPE);
-           datetime bar_time = iTime(_Symbol, _Period, 0);
-           datetime cooldown_end_time = bar_time + CooldownAfterSLBars * PeriodSeconds(_Period);
-           
+           datetime bar_time = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 0); // TICKET #3 Fix: Use SignalTimeframe
+           datetime cooldown_end_time = bar_time + CooldownAfterSLBars * PeriodSeconds((ENUM_TIMEFRAMES)SignalTimeframe); // TICKET #3 Fix: Use SignalTimeframe
            if (closing_deal_type == DEAL_TYPE_SELL)
            {
                g_cool_until_buy = cooldown_end_time;
@@ -1407,12 +1213,13 @@ void OnTick()
    {
       MqlDateTime dt;
       TimeToStruct(TimeCurrent(), dt);
-      ManageOpenPositions(dt, false); // IsTradingSession check is now inside CheckForNewTrades
+      ManageOpenPositions(dt, false);
    }
 
-   datetime bar_time = iTime(_Symbol, _Period, 0);
-   if(bar_time == 0 || bar_time == g_lastBarTime) return;
-   g_lastBarTime = bar_time;
+datetime bar_time = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 0);
+if(bar_time == 0 || bar_time == g_lastBarTime) return;
+g_lastBarTime = bar_time;
+
    CheckForNewTrades();
 }
 
@@ -1422,21 +1229,15 @@ void OnTick()
 //+------------------------------------------------------------------+
 void CheckForNewTrades()
 {
-   LogPerBarStatus();
-   UpdateHUD();
-   
    // --- EA Warmup Gate (T003) ---
-   long bars_avail = Bars(_Symbol, SignalTimeframe);
+   long bars_avail = Bars(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe);
    if (bars_avail < WarmupBars)
    {
-       datetime barTime = iTime(_Symbol, _Period, 0); 
+datetime barTime = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 0);
        if (g_last_ea_warmup_log_time != barTime)
        {
-           int sb_ok = (sb_handle != INVALID_HANDLE);
-           int ze_ok = (g_ze_handle != INVALID_HANDLE);
-           int bc_ok = (bc_handle != INVALID_HANDLE);
-           PrintFormat("[WARMUP] t=%s sb=%d ze=%d bc=%d need=%d have=%d",
-                       TimeToString(barTime), sb_ok, ze_ok, bc_ok, WarmupBars, (int)bars_avail);
+           PrintFormat("[WARMUP] t=%s sb_handle_ok=%d need=%d have=%d",
+                       TimeToString(barTime), (sb_handle != INVALID_HANDLE), WarmupBars, (int)bars_avail);
            g_last_ea_warmup_log_time = barTime;
        }
        return;
@@ -1446,7 +1247,7 @@ void CheckForNewTrades()
    int currentSpread = CurrentSpreadPoints();
    if (currentSpread > MaxSpreadPoints)
    {
-       datetime barTime = iTime(_Symbol, _Period, 1);
+       datetime barTime = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1);
        static datetime last_spread_log_time = 0;
        if (barTime != last_spread_log_time)
        {
@@ -1458,28 +1259,33 @@ void CheckForNewTrades()
    }
    
    const int readShift = MathMax(1, SB_ReadShift);
-
-   // --- BarsCalculated Gate ---
-   if(Bars(_Symbol, SignalTimeframe) < readShift + 2)
-   {
-      PrintFormat("%s BarsCalculated SB=%d", EVT_WAIT, (int)Bars(_Symbol, SignalTimeframe));
-      return;
-   }
    
-   // --- Hardened SB Buffer Read Gate ---
-   double sb_data[4]; // 0=sig, 1=conf, 2=reason, 3=ztf
-   for(int i = 0; i < 4; i++)
-   {
-      if(!Read1(sb_handle, i, readShift, sb_data[i], "SB"))
-      {
-         // Neutral values (0) are now set by Read1 on failure, and logging is handled inside.
-         // We can just return to wait for the next bar.
-         return;
-      }
-   }
-   int direction = (sb_data[SB_BUF_SIGNAL] > 0) ? 1 : (sb_data[SB_BUF_SIGNAL] < 0 ? -1 : 0);
-   double sbConf = sb_data[SB_BUF_CONF];
-   int sbReason = (int)sb_data[SB_BUF_REASON];
+   // --- TICKET #2: Read all data from SignalBrain in one go ---
+   double dSig=0,dConf=0,dReason=0,dZE=0,dSMC_S=0,dSMC_C=0,dBC=0;
+   bool ok=true;
+   ok&=Read1(sb_handle,SB_BUF_SIGNAL,  readShift,dSig,   "SB");
+   ok&=Read1(sb_handle,SB_BUF_CONF,    readShift,dConf,  "SB");
+   ok&=Read1(sb_handle,SB_BUF_REASON,  readShift,dReason,"SB");
+   ok&=Read1(sb_handle,SB_BUF_ZE,      readShift,dZE,    "SB");
+   ok&=Read1(sb_handle,SB_BUF_SMC_SIG, readShift,dSMC_S, "SB");
+   ok&=Read1(sb_handle,SB_BUF_SMC_CONF,readShift,dSMC_C, "SB");
+   ok&=Read1(sb_handle,SB_BUF_BC,      readShift,dBC,    "SB");
+   if(!ok) return; // closed-bar discipline
+   
+   int    direction    =(int)MathRound(dSig);
+   int    reason       =(int)MathRound(dReason);
+   int    smc_sig      =(int)MathRound(dSMC_S);
+   int    bc_bias      =(int)MathRound(dBC);
+   double final_conf   = dConf;
+   double ze_strength  = dZE;
+   double smc_conf     = dSMC_C;
+
+   // --- Update Visuals and Journaling with the new data ---
+   LogPerBarStatus(direction, final_conf, reason, ze_strength, bc_bias);
+   UpdateHUD(direction, final_conf, reason, ze_strength, bc_bias);
+
+   // --- Signal Gate ---
+   if(direction == 0) return;
 
    // --- Session Gate (Server Time) ---
    bool sess_ok = true;
@@ -1488,7 +1294,6 @@ void CheckForNewTrades()
       MqlDateTime dt;
       TimeToStruct(TimeTradeServer(), dt);
       const int hh = dt.hour;
-   
       if(SessionStartHourServer == SessionEndHourServer) sess_ok = true;
       else sess_ok = (SessionStartHourServer <= SessionEndHourServer)
                  ? (hh >= SessionStartHourServer && hh < SessionEndHourServer)
@@ -1496,18 +1301,18 @@ void CheckForNewTrades()
    }
    if(!sess_ok) { AAI_Block("session"); return; }
    
-   // --- Signal Gate ---
-   if(direction == 0) return;
+   datetime signal_bar_time = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, readShift);
    
-   double sbSig_prev=0;
-   Read1(sb_handle, SB_BUF_SIGNAL, readShift + 1, sbSig_prev);
-   
-   // --- T011: Over-extension Gate ---
+   // --- T011 & TICKET #3: Over-extension Gate ---
    static datetime last_overext_log_time = 0;
    double mid = 0, atr = 0, px = 0;
-   Read1(g_hOverextMA, 0, 1, mid);
-   Read1(g_hATR, 0, 1, atr);
-   px = iClose(_Symbol, SignalTimeframe, 1);
+double _tmp_ma_[1];
+if (CopyBuffer(g_hOverextMA, 0, 1, 1, _tmp_ma_) == 1)  mid = _tmp_ma_[0]; else mid = 0.0;
+
+double _tmp_atr_[1];
+if (CopyBuffer(g_hATR, 0, 1, 1, _tmp_atr_) == 1)       atr = _tmp_atr_[0]; else atr = 0.0;
+
+   px = iClose(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1);
    
    if(mid > 0 && atr > 0 && px > 0)
    {
@@ -1515,15 +1320,14 @@ void CheckForNewTrades()
       double dn = mid - OverExt_ATR_Mult * atr;
       bool is_over_long = (direction > 0 && px > up);
       bool is_over_short = (direction < 0 && px < dn);
-      
       if(OverExtMode == HardBlock)
       {
          if(is_over_long || is_over_short)
          {
-            if(g_lastBarTime != last_overext_log_time)
+            if(signal_bar_time != last_overext_log_time)
             {
-               PrintFormat("[OVEREXT_BLK] t=%s dir=%d px=%.5f up=%.5f dn=%.5f", TimeToString(g_lastBarTime), direction, px, up, dn);
-               last_overext_log_time = g_lastBarTime;
+               PrintFormat("[OVEREXT_BLK] t=%s dir=%d px=%.5f up=%.5f dn=%.5f", TimeToString(signal_bar_time), direction, px, up, dn);
+               last_overext_log_time = signal_bar_time;
             }
             AAI_Block("overext");
             return;
@@ -1544,11 +1348,17 @@ void CheckForNewTrades()
             }
             else
             {
-               g_overext_wait--;
-               if(g_lastBarTime != last_overext_log_time)
+               // TICKET #3 FIX: Decrement only once per new signal bar
+               if(signal_bar_time != g_last_overext_dec_sigbar)
                {
-                  PrintFormat("[OVEREXT_WAIT] t=%s left=%d dir=%d", TimeToString(g_lastBarTime), g_overext_wait, direction);
-                  last_overext_log_time = g_lastBarTime;
+                  g_overext_wait--;
+                  g_last_overext_dec_sigbar = signal_bar_time;
+               }
+               
+               if(signal_bar_time != last_overext_log_time)
+               {
+                  PrintFormat("[OVEREXT_WAIT] t=%s left=%d dir=%d", TimeToString(signal_bar_time), g_overext_wait, direction);
+                  last_overext_log_time = signal_bar_time;
                }
                AAI_Block("overext");
                return;
@@ -1557,72 +1367,46 @@ void CheckForNewTrades()
       }
    }
 
-   // --- T008: ZE Gating & Bonus ---
-   bool ze_ok_strength = true; // Assume true if gate is OFF
-   if(ZE_Gate != ZE_OFF)
-   {
-       Read1(g_ze_handle, 0, 1, g_ze_strength, "ZE");
-       ze_ok_strength = (g_ze_strength >= ZE_MinStrength);
-       if(ZE_Gate == ZE_REQUIRED && !ze_ok_strength)
-       {
-           AAI_Block("ZE_REQUIRED");
-           return;
-       }
-   }
-   
-   double conf_raw = 0.0, conf_eff = 0.0;
-   AAI_ComputeConfidence(sbConf, ze_ok_strength, conf_raw, conf_eff);
+    // --- TICKET #2: Adapted Gating Logic ---
+    // ZE Gate
+    if(ZE_Gate == ZE_REQUIRED && ze_strength < ZE_MinStrength)
+    {
+        AAI_Block("ZE_REQUIRED");
+        return;
+    }
 
-   // --- SMC Gating & Bonus ---
-   double smc_score = 0.0;
-   if(SMC_Mode != SMC_OFF)
-   {
-      double smc_sig=0.0;
-      Read1(g_smc_handle, 0, SB_ReadShift, smc_sig);
-      Read1(g_smc_handle, 1, SB_ReadShift, smc_score); // Use smc_score as the variable
-      bool smc_align = ((smc_sig > 0 && direction > 0) || (smc_sig < 0 && direction < 0));
-      if(SMC_Mode == SMC_REQUIRED)
-      {
-         bool smc_ok = smc_align && (smc_score >= SMC_MinConfidence);
-         if(!smc_ok){ AAI_Block("smc"); return; }
-      }
-      else if(SMC_Mode == SMC_PREFERRED)
-      {
-         if(smc_align && smc_score >= SMC_MinConfidence)
-            conf_eff += SMC_PREFERRED_BONUS;
-      }
-   }
+    // SMC Gate
+    if(SMC_Mode == SMC_REQUIRED)
+    {
+        if(smc_sig != direction || smc_conf < SMC_MinConfidence)
+        {
+            AAI_Block("SMC_REQUIRED");
+            return;
+        }
+    }
+    
+    // BC Gate
+    if(BC_AlignMode == BC_REQUIRED)
+    {
+        if(bc_bias != direction)
+        {
+            AAI_Block("BC_REQUIRED");
+            return;
+        }
+    }
+
+   // --- Final Confidence Gate (uses confidence directly from SignalBrain) ---
+   if(final_conf < MinConfidence) { AAI_Block("confidence"); return; }
    
-   // --- Confidence Gate ---
-   if(conf_eff < MinConfidence) { AAI_Block("confidence"); return; }
-   
-   // --- BC Gate ---
-   if (BC_AlignMode != BC_OFF && SB_PassThrough_UseBC) {
-       double htf_bias = 0;
-       if (Read1(bc_handle, BC_BUF_HTF_BIAS, readShift, htf_bias, "BC")) {
-           bool is_aligned = ((direction > 0 && htf_bias > 0) || (direction < 0 && htf_bias < 0));
-           if(BC_AlignMode == BC_REQUIRED && !is_aligned){ AAI_Block("bc"); return; }
-       }
-       else
-       {
-           if (g_lastBarTime != g_last_warn_time_bc)
-           {
-              PrintFormat("[DBG_BC] neutral");
-              g_last_warn_time_bc = g_lastBarTime;
-           }
-       }
-   }
-   
-   // --- Cooldown Gate ---
-   int secs = PeriodSeconds();
-   datetime current_bar_time = iTime(_Symbol, _Period, readShift);
+   // --- TICKET #3 FIX: Cooldown Gate ---
+   int secs = PeriodSeconds((ENUM_TIMEFRAMES)SignalTimeframe);
    datetime until = (direction > 0) ? g_cool_until_buy : g_cool_until_sell;
-   int delta = (int)(until - current_bar_time);
+   int delta = (int)(until - signal_bar_time);
    int bars_left = (delta <= 0 || secs <= 0) ? 0 : ( (delta + secs - 1) / secs );
    if(bars_left > 0) { AAI_Block("cooldown"); return; }
    
-   // --- Per-Bar Debounce Gate ---
-   if(PerBarDebounce && ((direction > 0) ? (g_last_entry_bar_buy == current_bar_time) : (g_last_entry_bar_sell == current_bar_time)))
+   // --- TICKET #3 FIX: Per-Bar Debounce Gate ---
+   if(PerBarDebounce && ((direction > 0) ? (g_last_entry_bar_buy == signal_bar_time) : (g_last_entry_bar_sell == signal_bar_time)))
    {
       AAI_Block("same_bar");
       return;
@@ -1630,7 +1414,11 @@ void CheckForNewTrades()
 
    // --- Trigger Gate ---
    string trigger = "";
-   bool is_edge = ((int)sb_data[SB_BUF_SIGNAL] != (int)sbSig_prev);
+   double sbSig_prev=0;
+   // We need to read the previous bar's signal from SB to detect an edge
+   Read1(sb_handle, SB_BUF_SIGNAL, readShift + 1, sbSig_prev, "SB_Prev");
+
+   bool is_edge = (direction != (int)sbSig_prev);
    if(EntryMode == FirstBarOrEdge && !g_bootstrap_done) trigger = "bootstrap";
    else if(is_edge) trigger = "edge";
    if(trigger == "") { AAI_Block("no_trigger"); return; }
@@ -1639,7 +1427,7 @@ void CheckForNewTrades()
    if(PositionSelect(_Symbol)) return;
    
    // --- All Gates Passed ---
-   if(TryOpenPosition(direction, conf_raw, conf_eff, sbReason, g_ze_strength, smc_score))
+   if(TryOpenPosition(direction, 0, final_conf, reason, ze_strength, smc_conf))
    {
       if(trigger == "bootstrap") g_bootstrap_done = true;
    }
@@ -1669,27 +1457,24 @@ void SendTelegramAlert(const string side, const double conf_eff, const double ze
                        const int reason_code)
 {
     if(!UseTelegramFromEA) return;
-
     string reason_text = ReasonCodeToString(reason_code);
     int sl_pips = (int)MathRound(MathAbs(entry - sl) / PipSize());
     int tp_pips = (tp > 0) ? (int)MathRound(MathAbs(entry - tp) / PipSize()) : 0;
     
-    // --- Get HTF Bias for the message ---
-    double htf_bias = 0;
-    Read1(bc_handle, BC_BUF_HTF_BIAS, SB_ReadShift, htf_bias, "BC");
+    // Read HTF Bias directly from SignalBrain's output for the message
+    double htf_bias_val = 0;
+    Read1(sb_handle, SB_BUF_BC, MathMax(1, SB_ReadShift), htf_bias_val, "SB_BC_Alert");
+    int htf_bias = (int)MathRound(htf_bias_val);
 
 
-    string msg_p1 = StringFormat("[Alfred_AI] %s %s • %s • conf %d • ZE %d/100 • bias %d",
+    string msg_p1 = StringFormat("[Alfred_AI] %s %s • %s • conf %d • ZE %.1f • bias %d",
                                  _Symbol, EnumToString(_Period), side, (int)conf_eff,
-                                 (int)ze_strength, (int)htf_bias);
-
+                                 ze_strength, htf_bias);
     string msg_p2 = StringFormat("Entry %.5f | SL %.5f (%dp) | TP %.5f (%dp) | R %.2f",
                                  entry, sl, sl_pips, tp, tp_pips, rr);
-    
     string msg_p3 = StringFormat("Reason: %s (%d)", reason_text, reason_code);
 
     string full_message = msg_p1 + "\n" + msg_p2 + "\n" + msg_p3;
-
     if(AlertsDryRun || StringLen(TelegramToken) == 0 || StringLen(TelegramChatID) == 0)
     {
         Print(full_message);
@@ -1703,14 +1488,12 @@ void SendTelegramAlert(const string side, const double conf_eff, const double ze
     string url = "https://api.telegram.org/bot" + TelegramToken +
                  "/sendMessage?chat_id=" + TelegramChatID +
                  "&text=" + url_message;
-    
     char post_data[];
     char result_data[];
     int res;
     string headers;
     ResetLastError();
     res = WebRequest("GET", url, NULL, NULL, 5000, post_data, 0, result_data, headers);
-
     if(res == 200)
     {
         Print(EVT_TG_OK);
@@ -1725,37 +1508,35 @@ void SendTelegramAlert(const string side, const double conf_eff, const double ze
 //+------------------------------------------------------------------+
 //| Attempts to open a trade and returns true on success             |
 //+------------------------------------------------------------------+
-bool TryOpenPosition(int signal, double conf_raw, double conf_eff, int reason_code, double ze_strength, double smc_score)
+bool TryOpenPosition(int signal, double conf_raw_unused, double conf_eff, int reason_code, double ze_strength, double smc_score)
 {
    MqlTick t;
    if(!SymbolInfoTick(_Symbol, t) || t.time_msc == 0){ return false; }
 
    const int    digs = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    const double pip_size = PipSize();
-   const double min_stop_dist = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
+const double min_stop_dist = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
    
    double atr_val_raw = 0;
-   Read1(g_hATR, 0, 1, atr_val_raw);
+double _tmp_atr_entry_[1];
+if (CopyBuffer(g_hATR, 0, 1, 1, _tmp_atr_entry_) == 1) atr_val_raw = _tmp_atr_entry_[0]; else atr_val_raw = 0.0;
    const double sl_dist = atr_val_raw + (SL_Buffer_Points * _Point);
 
    double entry = (signal > 0) ? t.ask : t.bid;
    double sl = 0, tp = 0;
    double rr = 0.0;
-   
-   if(signal > 0){ 
-      sl = NormalizeDouble(entry - sl_dist, digs);
-      if(Exit_FixedRR) { tp = NormalizeDouble(entry + Fixed_RR * (entry - sl), digs); rr = Fixed_RR; }
-      else tp = 0;
-   }
-   else if(signal < 0){ 
-      sl = NormalizeDouble(entry + sl_dist, digs);
-      if(Exit_FixedRR) { tp = NormalizeDouble(entry - Fixed_RR * (sl - entry), digs); rr = Fixed_RR; }
-      else tp = 0;
-   }
+// Clamp SL distance
+if(signal > 0){ // buy
+   if((entry - sl) < min_stop_dist) sl = NormalizeDouble(entry - min_stop_dist, digs);
+   if(tp > 0 && (tp - entry) < min_stop_dist) tp = NormalizeDouble(entry + min_stop_dist, digs);
+}else if(signal < 0){ // sell
+   if((sl - entry) < min_stop_dist) sl = NormalizeDouble(entry + min_stop_dist, digs);
+   if(tp > 0 && (entry - tp) < min_stop_dist) tp = NormalizeDouble(entry - min_stop_dist, digs);
+}
    
    // --- Duplicate Guard (MS) ---
    ulong now_ms = GetTickCount64();
-   datetime current_bar_time = iTime(_Symbol, _Period, 1);
+   datetime current_bar_time = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1); // TICKET #3 FIX
    string hash_str = StringFormat("%I64d|%d|%.*f", (long)current_bar_time, signal, digs, entry);
    ulong sig_h = StringToULongHash(hash_str);
    if(DuplicateGuardMs > 0 && g_last_send_sig_hash == sig_h && (now_ms - g_last_send_ms) < DuplicateGuardMs)
@@ -1773,23 +1554,20 @@ bool TryOpenPosition(int signal, double conf_raw, double conf_eff, int reason_co
    
    string signal_str = (signal == 1) ? "BUY" : "SELL";
    string comment = StringFormat("AAI|%.1f|%d|%d|%.1f|%.5f|%.5f|%.1f",
-                                 conf_raw, (int)conf_eff, reason_code, ze_strength, sl, tp, smc_score);
-                                 
+                                 conf_eff, (int)conf_eff, reason_code, ze_strength, sl, tp, smc_score);
    // --- Log Trade Idea ---
-   PrintFormat("%s dir=%s entry=%.5f sl=%.5f tp=%.5f R=%.2f conf=%.0f ze=%.0f", 
+   PrintFormat("%s dir=%s entry=%.5f sl=%.5f tp=%.5f R=%.2f conf=%.0f ze=%.1f", 
       EVT_IDEA, signal_str, entry, sl, tp, rr, conf_eff, ze_strength);
-
+      
    // --- T007: Manual Approval Gate ---
    if(ExecutionMode == AutoExecute && ApprovalMode == Manual)
    {
-       datetime barTime = iTime(_Symbol, SignalTimeframe, 1);
+       datetime barTime = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1);
        string gv_key = StringFormat("AAI_APPROVE_%s_%d_%I64d", _Symbol, (int)SignalTimeframe, (long)barTime);
        
        double approval_value = GlobalVariableGet(gv_key);
-
        if(approval_value != 1.0)
        {
-           // Log once per bar that we are waiting for approval
            static datetime last_approval_wait_log = 0;
            if(barTime != last_approval_wait_log)
            {
@@ -1797,10 +1575,8 @@ bool TryOpenPosition(int signal, double conf_raw, double conf_eff, int reason_co
                last_approval_wait_log = barTime;
            }
            AAI_Block("manual_approval");
-           return false; // Block the trade
+           return false;
        }
-
-       // Approval consumed, reset it.
        g_entries++;
        GlobalVariableSet(gv_key, 0.0);
        PrintFormat("[CONSUMED_APPROVAL] %s reset to 0.0", gv_key);
@@ -1809,10 +1585,13 @@ bool TryOpenPosition(int signal, double conf_raw, double conf_eff, int reason_co
    // --- HYBRID HOURS SWITCH ---
    if(!AAI_HourDayAutoOK())
    {
-      double smc_conf=0.0; if(g_smc_handle!=INVALID_HANDLE) Read1(g_smc_handle, 1, SB_ReadShift, smc_conf);
+      // Get SMC conf from SB data for the alert
+      double smc_conf_val = 0;
+      Read1(sb_handle, SB_BUF_SMC_CONF, MathMax(1, SB_ReadShift), smc_conf_val, "SB_SMC_Alert");
+
       int spread_pts = CurrentSpreadPoints();
       double atr_pips = atr_val_raw / pip_size;
-      AAI_RaiseHybridAlert(signal_str, conf_eff, ze_strength, smc_conf, spread_pts, atr_pips, entry, sl, tp);
+      AAI_RaiseHybridAlert(signal_str, conf_eff, ze_strength, smc_conf_val, spread_pts, atr_pips, entry, sl, tp);
       AAI_Block("hybrid");
       return false;
    }
@@ -1820,7 +1599,7 @@ bool TryOpenPosition(int signal, double conf_raw, double conf_eff, int reason_co
    if(ExecutionMode == AutoExecute){
       g_last_side      = signal_str;
       g_last_entry     = entry; g_last_sl = sl; g_last_tp = tp; g_last_vol = lots_to_trade;
-      g_last_rr        = rr; g_last_conf_raw = conf_raw; g_last_conf_eff = conf_eff;
+      g_last_rr        = rr; g_last_conf_raw = conf_eff; g_last_conf_eff = conf_eff;
       g_last_ze        = ze_strength; g_last_comment = comment;
       
       if(Hybrid_RequireApproval)
@@ -1831,7 +1610,7 @@ bool TryOpenPosition(int signal, double conf_raw, double conf_eff, int reason_co
             g_last_telegram_alert_bar = g_lastBarTime;
          }
          
-         if(EmitIntent(g_last_side, g_last_entry, g_last_sl, g_last_tp, g_last_vol, g_last_rr, g_last_conf_raw, g_last_conf_eff, g_last_ze)) 
+         if(EmitIntent(g_last_side, g_last_entry, g_last_sl, g_last_tp, g_last_vol, g_last_rr, conf_eff, conf_eff, g_last_ze)) 
             return false;
          else 
             return false;
@@ -1841,24 +1620,21 @@ bool TryOpenPosition(int signal, double conf_raw, double conf_eff, int reason_co
       g_last_send_ms = now_ms;
       trade.SetDeviationInPoints(MaxSlippagePoints);
       bool order_sent = (signal > 0) ? trade.Buy(lots_to_trade, symbolName, 0, sl, tp, comment) : trade.Sell(lots_to_trade, symbolName, 0, sl, tp, comment);
-      
-if(order_sent && (trade.ResultRetcode() == TRADE_RETCODE_DONE || trade.ResultRetcode() == TRADE_RETCODE_DONE_PARTIAL))
-{
-    g_entries++;
-    PrintFormat("%s Signal:%s → Executed %.2f lots @%.5f | SL:%.5f TP:%.5f",
+      if(order_sent && (trade.ResultRetcode() == TRADE_RETCODE_DONE || trade.ResultRetcode() == TRADE_RETCODE_DONE_PARTIAL))
+      {
+         g_entries++;
+         PrintFormat("%s Signal:%s → Executed %.2f lots @%.5f | SL:%.5f TP:%.5f",
                 EVT_ENTRY, signal_str, trade.ResultVolume(), trade.ResultPrice(), sl, tp);
+         double exec_lots = (trade.ResultVolume() > 0.0 ? trade.ResultVolume() : lots_to_trade);
+         AAI_LogExec(signal > 0 ? +1 : -1, exec_lots);
 
-    // >>> EXEC line to Journal (tester shows it)
-    double exec_lots = (trade.ResultVolume() > 0.0 ? trade.ResultVolume() : lots_to_trade);
-    AAI_LogExec(signal > 0 ? +1 : -1, exec_lots);  // optional 3rd arg: "Flow+"
+         if(signal > 0) g_last_entry_bar_buy = current_bar_time;
+         else           g_last_entry_bar_sell = current_bar_time;
 
-    if(signal > 0) g_last_entry_bar_buy = current_bar_time;
-    else           g_last_entry_bar_sell = current_bar_time;
-
-    return true;
-}
-
-      else{
+         return true;
+      }
+      else
+      {
          if(g_lastBarTime != g_last_suppress_log_time){
             PrintFormat("%s reason=trade_send_failed details=retcode:%d", EVT_SUPPRESS, trade.ResultRetcode());
             g_last_suppress_log_time = g_lastBarTime;
@@ -1965,10 +1741,9 @@ void HandlePartialProfits()
    
    double initial_risk_pips = MathAbs(open_price - sl_price) / PipSize();
    if(initial_risk_pips <= 0) return;
-
    long type = PositionGetInteger(POSITION_TYPE);
-   double current_profit_pips = (type == POSITION_TYPE_BUY) ? (SymbolInfoDouble(symbolName, SYMBOL_BID) - open_price) / PipSize() : (open_price - SymbolInfoDouble(symbolName, SYMBOL_ASK)) / PipSize();
-   
+   double current_profit_pips = (type == POSITION_TYPE_BUY) ?
+   (SymbolInfoDouble(symbolName, SYMBOL_BID) - open_price) / PipSize() : (open_price - SymbolInfoDouble(symbolName, SYMBOL_ASK)) / PipSize();
    if(current_profit_pips >= initial_risk_pips * Partial_R_multiple)
    {
       ulong ticket = PositionGetInteger(POSITION_TICKET);
@@ -1977,7 +1752,6 @@ void HandlePartialProfits()
       double lot_step = SymbolInfoDouble(symbolName, SYMBOL_VOLUME_STEP);
       close_volume = round(close_volume / lot_step) * lot_step;
       if(close_volume < lot_step) return;
-      
       if(trade.PositionClosePartial(ticket, close_volume))
       {
           double be_sl_price = open_price + ((type == POSITION_TYPE_BUY) ? BE_Offset_Points * _Point : -BE_Offset_Points * _Point);
@@ -2030,7 +1804,8 @@ void JournalClosedPosition(ulong position_id)
       }
       else
       {
-         last_out_ticket = deal_ticket; // This will be the last one at the end of the loop
+         last_out_ticket = deal_ticket;
+         // This will be the last one at the end of the loop
       }
       total_profit += HistoryDealGetDouble(deal_ticket, DEAL_PROFIT) + HistoryDealGetDouble(deal_ticket, DEAL_COMMISSION) + HistoryDealGetDouble(deal_ticket, DEAL_SWAP);
    }
@@ -2100,7 +1875,6 @@ void JournalClosedPosition(ulong position_id)
                                  position_id, // Using Position ID as the unique ticket/identifier for the trade
                                  comment_initial
                                 );
-                                 
       FileWriteString(file_handle, line);
       FileClose(file_handle);
    }
