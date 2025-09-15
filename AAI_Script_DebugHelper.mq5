@@ -1,129 +1,169 @@
 //+------------------------------------------------------------------+
 //|                    AAI_Script_DebugHelper.mq5                    |
-//|                        v2.0 (Corrected)                          |
-//|       Runs ONCE to print live data from Alfred modules.          |
-//|              Copyright 2025, AlfredAI Project                    |
+//|                 v3.0 - SignalBrain v4 Refactor                   |
+//|       Runs ONCE to print live data from the new SignalBrain.     |
+//|                                                                  |
+//| Copyright 2025, AlfredAI Project                                 |
 //+------------------------------------------------------------------+
 #property strict
 #property script_show_inputs // Defines this file as a script
-#property version "2.0"
+#property version "3.0"
 
-// --- Constants for Analysis (should match SignalBrain)
-const ENUM_TIMEFRAMES HTF = PERIOD_H4;
-const ENUM_TIMEFRAMES LTF = PERIOD_M15;
+// --- TICKET #4: Define SignalBrain buffer indices ---
+#define SB_BUF_SIGNAL   0
+#define SB_BUF_CONF     1
+#define SB_BUF_REASON   2
+#define SB_BUF_ZE       3
+#define SB_BUF_SMC_SIG  4
+#define SB_BUF_SMC_CONF 5
+#define SB_BUF_BC       6
+
+// --- TICKET #4: Matching EA Pass-Through Inputs ---
+input group "--- SignalBrain Pass-Through Inputs ---";
+input bool   SB_SafeTest        = false;
+input bool   SB_UseZE           = true;
+input bool   SB_UseBC           = true;
+input bool   SB_UseSMC          = true;
+input int    SB_WarmupBars      = 150;
+input int    SB_FastMA          = 10;
+input int    SB_SlowMA          = 30;
+input int    SB_MinZoneStrength = 4;
+input bool   SB_EnableDebug     = true;
+input int    SB_Bonus_ZE        = 25;
+input int    SB_Bonus_BC        = 25;
+input int    SB_Bonus_SMC       = 25;
+input int    SB_BC_FastMA       = 10;
+input int    SB_BC_SlowMA       = 30;
+input double SB_ZE_MinImpulseMovePips = 10.0;
+input bool   SB_SMC_UseFVG      = true;
+input bool   SB_SMC_UseOB       = true;
+input bool   SB_SMC_UseBOS      = true;
+input double SB_SMC_FVG_MinPips = 1.0;
+input int    SB_SMC_OB_Lookback = 20;
+input int    SB_SMC_BOS_Lookback= 50;
 
 // --- Helper Enums (copied from SignalBrain for decoding)
 enum ENUM_REASON_CODE
 {
     REASON_NONE,
+    REASON_BUY_HTF_CONTINUATION,
+    REASON_SELL_HTF_CONTINUATION,
     REASON_BUY_LIQ_GRAB_ALIGNED,
     REASON_SELL_LIQ_GRAB_ALIGNED,
     REASON_NO_ZONE,
     REASON_LOW_ZONE_STRENGTH,
-    REASON_BIAS_CONFLICT
+    REASON_BIAS_CONFLICT,
+    REASON_TEST_SCENARIO
 };
+
+// --- Indicator Path Helper ---
+#define AAI_IND_PREFIX "AlfredAI\\"
+inline string AAI_Ind(const string name)
+{
+   if(StringFind(name, AAI_IND_PREFIX) == 0) return name;
+   return AAI_IND_PREFIX + name;
+}
 
 //+------------------------------------------------------------------+
 //| Script program start function                                    |
 //+------------------------------------------------------------------+
 void OnStart()
 {
-    Print("✅ AAI DebugHelper Script Running...");
+    Print("✅ AAI DebugHelper Script Running (v3.0)...");
 
-    //--- 1. Fetch BiasCompass Data ---
-    double htf_bias_arr[1], ltf_bias_arr[1];
-    CopyBuffer(iCustom(_Symbol, HTF, "AAI_Indicator_BiasCompass.ex5"), 0, 1, 1, htf_bias_arr); // Use index 1 for closed bar data
-    CopyBuffer(iCustom(_Symbol, LTF, "AAI_Indicator_BiasCompass.ex5"), 0, 1, 1, ltf_bias_arr);
-    string htf_bias_str = BiasToString(htf_bias_arr[0]);
-    string ltf_bias_str = BiasToString(ltf_bias_arr[0]);
+    // TICKET #4: Create a single handle to SignalBrain with all pass-throughs
+    int sb_handle = iCustom(_Symbol, _Period, AAI_Ind("AAI_Indicator_SignalBrain"),
+                            SB_SafeTest, SB_UseZE, SB_UseBC, SB_UseSMC, SB_WarmupBars, SB_FastMA, SB_SlowMA,
+                            SB_MinZoneStrength, SB_EnableDebug,
+                            SB_Bonus_ZE, SB_Bonus_BC, SB_Bonus_SMC,
+                            SB_BC_FastMA, SB_BC_SlowMA,
+                            SB_ZE_MinImpulseMovePips,
+                            SB_SMC_UseFVG, SB_SMC_UseOB, SB_SMC_UseBOS, SB_SMC_FVG_MinPips,
+                            SB_SMC_OB_Lookback, SB_SMC_BOS_Lookback);
 
-    //--- 2. Fetch ZoneEngine Data (from current chart timeframe) ---
-    double zone_engine_data[6]; // 0:Status, 1:Magnet, 2:Strength, 3:Fresh, 4:Vol, 5:Liq
-    CopyBuffer(iCustom(_Symbol, _Period, "AAI_Indicator_ZoneEngine.ex5"), 0, 1, 6, zone_engine_data);
-    string zone_type_str = ZoneTypeToString(zone_engine_data[0]);
-    double zone_score = zone_engine_data[2];
-    string liq_grab_str = (zone_engine_data[5] > 0.5) ? "true" : "false";
+    if(sb_handle == INVALID_HANDLE)
+    {
+        Print("❌ ERROR: Could not get a handle to AAI_Indicator_SignalBrain. Is it compiled?");
+        return;
+    }
+
+    // TICKET #4: Defensive read pattern for all 7 buffers on the last closed bar (shift=1)
+    double v0[1],v1[1],v2[1],v3[1],v4[1],v5[1],v6[1];
+    if(CopyBuffer(sb_handle,SB_BUF_SIGNAL,   1,1,v0)!=1 ||
+       CopyBuffer(sb_handle,SB_BUF_CONF,     1,1,v1)!=1 ||
+       CopyBuffer(sb_handle,SB_BUF_REASON,   1,1,v2)!=1 ||
+       CopyBuffer(sb_handle,SB_BUF_ZE,       1,1,v3)!=1 ||
+       CopyBuffer(sb_handle,SB_BUF_SMC_SIG,  1,1,v4)!=1 ||
+       CopyBuffer(sb_handle,SB_BUF_SMC_CONF, 1,1,v5)!=1 ||
+       CopyBuffer(sb_handle,SB_BUF_BC,       1,1,v6)!=1)
+    {
+       Print("❌ ERROR: Failed to copy buffer data from SignalBrain. Indicator may be warming up.");
+       IndicatorRelease(sb_handle);
+       return;
+    }
     
-    //--- 3. Fetch SignalBrain Data ---
-    double brain_data[4]; // 0:Signal, 1:Confidence, 2:ReasonCode, 3:ZoneTF
-    CopyBuffer(iCustom(_Symbol, _Period, "AAI_Indicator_SignalBrain.ex5"), 0, 1, 4, brain_data);
-    string signal_str = SignalToString(brain_data[0]);
-    double confidence_score = brain_data[1];
-    string reason_str = ReasonCodeToString(brain_data[2]);
-    string zone_tf_str = PeriodSecondsToTFString((int)brain_data[3] * 60);
-    
-    //--- 4. Format and Print All Data ---
+    // Extract and typecast the data
+    int    sig   = (int)MathRound(v0[0]);
+    double conf  = v1[0];
+    int    rsn   = (int)MathRound(v2[0]);
+    double ze    = v3[0];
+    int    smc_s = (int)MathRound(v4[0]);
+    double smc_c = v5[0];
+    int    bc    = (int)MathRound(v6[0]);
+
+    // --- Format and Print All Data ---
     Print("-------------------[ AAI DEBUG REPORT ]-------------------");
-    PrintFormat("🧭 Compass — HTF Bias: %s, LTF Bias: %s", htf_bias_str, ltf_bias_str);
-    PrintFormat("🧱 ZoneEngine — Zone: %s %s | Score: %.0f | LiquidityGrab: %s", zone_tf_str, zone_type_str, zone_score, liq_grab_str);
-    PrintFormat("🧠 SignalBrain — Signal: %s | Confidence: %.0f | Reason: \"%s\"", signal_str, confidence_score, reason_str);
+PrintFormat("Bar Time: %s", TimeToString(iTime(_Symbol, _Period, 1), TIME_DATE|TIME_SECONDS));
+    Print("---");
+    PrintFormat("🧠 SignalBrain Output:");
+    PrintFormat("   - Final Signal: %s (%d)", SignalToString(sig), sig);
+    PrintFormat("   - Final Confidence: %.1f / 100", conf);
+    PrintFormat("   - Reason Code: \"%s\" (%d)", ReasonCodeToString(rsn), rsn);
+    Print("---");
+    PrintFormat("🧱 Raw Features (for Gating):");
+    PrintFormat("   - ZE Strength: %.2f", ze);
+    PrintFormat("   - BC Bias: %s (%d)", BiasToString(bc), bc);
+    PrintFormat("   - SMC Signal: %s (%d)", SignalToString(smc_s), smc_s);
+    PrintFormat("   - SMC Confidence: %.1f / 10", smc_c);
     Print("----------------------------------------------------------");
 
+    IndicatorRelease(sb_handle);
 }
 
 //+------------------------------------------------------------------+
-//|                      HELPER FUNCTIONS                          |
+//| HELPER FUNCTIONS                                                 |
 //+------------------------------------------------------------------+
 
-//--- Converts bias buffer value to a readable string
-string BiasToString(double bias_value)
+string BiasToString(int bias_value)
 {
-    if(bias_value > 0.5) return "BULL";
-    if(bias_value < -0.5) return "BEAR";
+    if(bias_value > 0) return "BULL";
+    if(bias_value < 0) return "BEAR";
     return "NEUTRAL";
 }
 
-//--- Converts zone status buffer value to a readable string
-string ZoneTypeToString(double zone_status)
+string SignalToString(int signal_value)
 {
-    if(zone_status > 0.5) return "Demand";
-    if(zone_status < -0.5) return "Supply";
-    return "None";
-}
-
-//--- Converts signal buffer value to a readable string
-string SignalToString(double signal_value)
-{
-    if(signal_value > 0.5) return "BUY";
-    if(signal_value < -0.5) return "SELL";
+    if(signal_value > 0) return "BUY";
+    if(signal_value < 0) return "SELL";
     return "NONE";
 }
 
-//--- Converts timeframe (in seconds) to a short string like "H1"
-string PeriodSecondsToTFString(int seconds)
-{
-    switch(seconds)
-    {
-        case 900:    return "M15";
-        case 1800:   return "M30";
-        case 3600:   return "H1";
-        case 7200:   return "H2";
-        case 14400:  return "H4";
-        case 86400:  return "D1";
-        default:     return "Chart"; // Fallback for current chart period if not matched
-    }
-}
-
-
-//--- Converts reason code buffer value to a readable string
-string ReasonCodeToString(double reason_code)
+string ReasonCodeToString(int reason_code)
 {
     ENUM_REASON_CODE code = (ENUM_REASON_CODE)reason_code;
     switch(code)
     {
-        case REASON_BUY_LIQ_GRAB_ALIGNED:
-            return "Buy signal due to Liquidity Grab in Demand Zone with Bias Alignment.";
-        case REASON_SELL_LIQ_GRAB_ALIGNED:
-            return "Sell signal due to Liquidity Grab in Supply Zone with Bias Alignment.";
-        case REASON_NO_ZONE:
-            return "No signal: Price is not inside an active Supply/Demand zone.";
-        case REASON_LOW_ZONE_STRENGTH:
-            return "No signal: Active zone strength is below threshold.";
-        case REASON_BIAS_CONFLICT:
-            return "No signal: HTF and LTF biases are in conflict.";
+        case REASON_BUY_HTF_CONTINUATION:   return "Buy HTF Continuation";
+        case REASON_SELL_HTF_CONTINUATION:  return "Sell HTF Continuation";
+        case REASON_BUY_LIQ_GRAB_ALIGNED:   return "Buy Liq. Grab Aligned";
+        case REASON_SELL_LIQ_GRAB_ALIGNED:  return "Sell Liq. Grab Aligned";
+        case REASON_NO_ZONE:                return "No Zone";
+        case REASON_LOW_ZONE_STRENGTH:      return "Low Zone Strength";
+        case REASON_BIAS_CONFLICT:          return "Bias Conflict";
+        case REASON_TEST_SCENARIO:          return "Test Scenario";
         case REASON_NONE:
         default:
-            return "No signal: Conditions not met.";
+            return "None";
     }
 }
 //+------------------------------------------------------------------+
