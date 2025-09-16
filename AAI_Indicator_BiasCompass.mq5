@@ -1,13 +1,13 @@
 //+------------------------------------------------------------------+
 //|                  AAI_Indicator_BiasCompass.mq5                   |
-//|                    v3.0 - iMA Handle Refactor                    |
+//|                    v3.1 - iCustom Handle Fix                     |
 //|        (Determines multi-timeframe directional bias)             |
 //|                                                                  |
-//| Copyright 2025, AlfredAI Project                    |
+//| Copyright 2025, AlfredAI Project                                 |
 //+------------------------------------------------------------------+
 #property indicator_chart_window
 #property strict
-#property version "3.0"
+#property version "3.1" // Version incremented for the fix
 
 // --- Headless, single-buffer output ---
 #property indicator_plots   1
@@ -30,7 +30,7 @@ int g_slowMA_handle = INVALID_HANDLE;
 
 // --- Globals ---
 static datetime g_last_log_time = 0;
-static datetime g_last_warmup_ind_log_time = 0; // T003
+static datetime g_last_warmup_ind_log_time = 0;
 
 
 //+------------------------------------------------------------------+
@@ -43,14 +43,16 @@ int OnInit()
     ArraySetAsSeries(BiasBuffer, true);
     PlotIndexSetDouble(0, PLOT_EMPTY_VALUE, 0.0);
 
-    // --- Create MA handles using native iMA ---
-    g_fastMA_handle = iMA(_Symbol, _Period, BC_FastMA, 0, BC_MAMethod, BC_Price);
-    g_slowMA_handle = iMA(_Symbol, _Period, BC_SlowMA, 0, BC_MAMethod, BC_Price);
+    // --- TICKET FIX: Create MA handles using explicit iCustom to prevent [4002] error ---
+    // The iCustom function for the built-in Moving Average takes these parameters:
+    // ma_period, ma_shift, ma_method, applied_price
+    g_fastMA_handle = iCustom(_Symbol, _Period, "Examples\\Custom Moving Average", BC_FastMA, 0, BC_MAMethod, BC_Price);
+    g_slowMA_handle = iCustom(_Symbol, _Period, "Examples\\Custom Moving Average", BC_SlowMA, 0, BC_MAMethod, BC_Price);
     
     // --- Validate handles ---
     if(g_fastMA_handle < 0 || g_slowMA_handle < 0)
     {
-        Print("[INIT_ERROR] BiasCompass iMA handle failed");
+        Print("[INIT_ERROR] BiasCompass iCustom handle failed");
         return(INIT_FAILED);
     }
 
@@ -119,7 +121,7 @@ int OnCalculate(const int rates_total,
         // --- Compute and write bias ---
         double bias = (f[0] > s[0]) ? 1.0 : (f[0] < s[0] ? -1.0 : 0.0);
         BiasBuffer[i] = bias;
-
+        
         // --- Log the state of the last fully closed bar (shift=1) ---
         if(i == 1 && EnableDebugLogging && time[rates_total - 1] != g_last_log_time)
         {
@@ -137,4 +139,3 @@ int OnCalculate(const int rates_total,
     return(rates_total);
 }
 //+------------------------------------------------------------------+
-
