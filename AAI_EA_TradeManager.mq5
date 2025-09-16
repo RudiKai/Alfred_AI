@@ -1510,61 +1510,116 @@ void SendTelegramAlert(const string side, const double conf_eff, const double ze
 //+------------------------------------------------------------------+
 bool TryOpenPosition(int signal, double conf_raw_unused, double conf_eff, int reason_code, double ze_strength, double smc_score)
 {
+   // ----- tick / basics -----
    MqlTick t;
    if(!SymbolInfoTick(_Symbol, t) || t.time_msc == 0){ return false; }
 
-   const int    digs = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-   const double pip_size = PipSize();
-const double min_stop_dist = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
-   
-   double atr_val_raw = 0;
-double _tmp_atr_entry_[1];
-if (CopyBuffer(g_hATR, 0, 1, 1, _tmp_atr_entry_) == 1) atr_val_raw = _tmp_atr_entry_[0]; else atr_val_raw = 0.0;
-   const double sl_dist = atr_val_raw + (SL_Buffer_Points * _Point);
+   const int    digs          = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   const double pt         = _Point;
+   const double pip_size      = PipSize();
+   const double min_stop_dist = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL)  * pt;
 
-   double entry = (signal > 0) ? t.ask : t.bid;
-   double sl = 0, tp = 0;
+   // ----- ATR for SL distance (closed bar), with defensive read -----
+   double atr_val_raw = 0.0;
+   {
+      double _tmp_atr_entry_[1];
+      if(CopyBuffer(g_hATR, 0, 1, 1, _tmp_atr_entry_) == 1) atr_val_raw = _tmp_atr_entry_[0];
+      else atr_val_raw = 0.0;
+   }
+
+   // Base SL distance: ATR + buffer, but never less than broker min stop distance
+   const double sl_dist_raw = atr_val_raw + (SL_Buffer_Points * point);
+   const double sl_dist     = MathMax(sl_dist_raw, min_stop_dist);
+
+   // ----- entry / initial SL-TP based on signal & settings -----
+   const double entry = (signal > 0 ? t.ask : t.bid);
+   double sl = 0.0, tp = 0.0;
    double rr = 0.0;
-// Clamp SL distance
-if(signal > 0){ // buy
-   if((entry - sl) < min_stop_dist) sl = NormalizeDouble(entry - min_stop_dist, digs);
-   if(tp > 0 && (tp - entry) < min_stop_dist) tp = NormalizeDouble(entry + min_stop_dist, digs);
-}else if(signal < 0){ // sell
-   if((sl - entry) < min_stop_dist) sl = NormalizeDouble(entry + min_stop_dist, digs);
-   if(tp > 0 && (entry - tp) < min_stop_dist) tp = NormalizeDouble(entry - min_stop_dist, digs);
-}
-   
-   // --- Duplicate Guard (MS) ---
+
+   if(signal > 0) // BUY
+   {
+      sl = NormalizeDouble(entry - sl_dist, digs);
+
+      if(Exit_FixedRR)
+      {
+         // risk distance is entry - sl, but ensure at least min stop
+         const double risk_dist = MathMax(entry - sl, min_stop_dist);
+         tp = NormalizeDouble(entry + Fixed_RR * risk_dist, digs);
+         rr = Fixed_RR;
+      }
+      else
+      {
+         tp = 0.0; // keep your non-FixedRR behavior
+      }
+   }
+   else if(signal < 0) // SELL
+   {
+      sl = NormalizeDouble(entry + sl_dist, digs);
+
+      if(Exit_FixedRR)
+      {
+         const double risk_dist = MathMax(sl - entry, min_stop_dist);
+         tp = NormalizeDouble(entry - Fixed_RR * risk_dist, digs);
+         rr = Fixed_RR;
+      }
+      else
+      {
+         tp = 0.0; // keep your non-FixedRR behavior
+      }
+   }
+   else
+   {
+      // neutral signal — nothing to do
+      return false;
+   }
+
+   // ----- safety clamp vs broker Stops Level (belt & suspenders) -----
+   if(signal > 0) // BUY
+   {
+      if(sl > 0.0 && (entry - sl) < min_stop_dist) sl = NormalizeDouble(entry - min_stop_dist, digs);
+      if(Exit_FixedRR && tp > 0.0 && (tp - entry) < min_stop_dist) tp = NormalizeDouble(entry + min_stop_dist, digs);
+   }
+   else // SELL
+   {
+      if(sl > 0.0 && (sl - entry) < min_stop_dist) sl = NormalizeDouble(entry + min_stop_dist, digs);
+      if(Exit_FixedRR && tp > 0.0 && (entry - tp) < min_stop_dist) tp = NormalizeDouble(entry - min_stop_dist, digs);
+   }
+
+   // ----- Duplicate Guard (MS) -----
    ulong now_ms = GetTickCount64();
    datetime current_bar_time = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1); // TICKET #3 FIX
-   string hash_str = StringFormat("%I64d|%d|%.*f", (long)current_bar_time, signal, digs, entry);
-   ulong sig_h = StringToULongHash(hash_str);
+   string   hash_str = StringFormat("%I64d|%d|%.*f", (long)current_bar_time, signal, digs, entry);
+   ulong    sig_h    = StringToULongHash(hash_str);
    if(DuplicateGuardMs > 0 && g_last_send_sig_hash == sig_h && (now_ms - g_last_send_ms) < DuplicateGuardMs)
-   { return false; }
+      return false;
 
-   // --- Stop Level Validation ---
+   // ----- Stop Level validation before sizing -----
    bool ok_side = (signal > 0) ? (sl < entry) : (entry < sl);
-   if (tp != 0) ok_side &= (signal > 0) ? (entry < tp) : (tp < entry);
-   bool ok_dist = (MathAbs(entry - sl) >= min_stop_dist);
-   if(tp != 0) ok_dist &= (MathAbs(tp - entry) >= min_stop_dist);
-   if(!ok_side || !ok_dist){ return false; }
+   if (tp != 0.0) ok_side &= (signal > 0) ? (entry < tp) : (tp < entry);
 
+   bool ok_dist = (MathAbs(entry - sl) >= min_stop_dist);
+   if(tp != 0.0) ok_dist &= (MathAbs(tp - entry) >= min_stop_dist);
+
+   if(!ok_side || !ok_dist) return false;
+
+   // ----- lot sizing based on actual risk distance -----
    double lots_to_trade = CalculateLotSize((int)conf_eff, MathAbs(entry - sl));
    if(lots_to_trade < MinLotSize) return false;
-   
+
    string signal_str = (signal == 1) ? "BUY" : "SELL";
    string comment = StringFormat("AAI|%.1f|%d|%d|%.1f|%.5f|%.5f|%.1f",
                                  conf_eff, (int)conf_eff, reason_code, ze_strength, sl, tp, smc_score);
-   // --- Log Trade Idea ---
-   PrintFormat("%s dir=%s entry=%.5f sl=%.5f tp=%.5f R=%.2f conf=%.0f ze=%.1f", 
-      EVT_IDEA, signal_str, entry, sl, tp, rr, conf_eff, ze_strength);
-      
-   // --- T007: Manual Approval Gate ---
+
+   // ----- idea log (now with final, clamped SL/TP) -----
+   PrintFormat("%s dir=%s entry=%.5f sl=%.5f tp=%.5f R=%.2f conf=%.0f ze=%.1f",
+               EVT_IDEA, signal_str, entry, sl, tp, rr, conf_eff, ze_strength);
+
+   // ----- T007: Manual Approval Gate -----
    if(ExecutionMode == AutoExecute && ApprovalMode == Manual)
    {
        datetime barTime = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1);
-       string gv_key = StringFormat("AAI_APPROVE_%s_%d_%I64d", _Symbol, (int)SignalTimeframe, (long)barTime);
-       
+       string   gv_key  = StringFormat("AAI_APPROVE_%s_%d_%I64d", _Symbol, (int)SignalTimeframe, (long)barTime);
+
        double approval_value = GlobalVariableGet(gv_key);
        if(approval_value != 1.0)
        {
@@ -1582,26 +1637,28 @@ if(signal > 0){ // buy
        PrintFormat("[CONSUMED_APPROVAL] %s reset to 0.0", gv_key);
    }
 
-   // --- HYBRID HOURS SWITCH ---
+   // ----- HYBRID HOURS SWITCH -----
    if(!AAI_HourDayAutoOK())
    {
       // Get SMC conf from SB data for the alert
-      double smc_conf_val = 0;
+      double smc_conf_val = 0.0;
       Read1(sb_handle, SB_BUF_SMC_CONF, MathMax(1, SB_ReadShift), smc_conf_val, "SB_SMC_Alert");
 
-      int spread_pts = CurrentSpreadPoints();
-      double atr_pips = atr_val_raw / pip_size;
+      int    spread_pts = CurrentSpreadPoints();
+      double atr_pips   = (pip_size > 0.0 ? atr_val_raw / pip_size : 0.0);
       AAI_RaiseHybridAlert(signal_str, conf_eff, ze_strength, smc_conf_val, spread_pts, atr_pips, entry, sl, tp);
       AAI_Block("hybrid");
       return false;
    }
-   
-   if(ExecutionMode == AutoExecute){
+
+   // ----- send order (AutoExecute path) -----
+   if(ExecutionMode == AutoExecute)
+   {
       g_last_side      = signal_str;
       g_last_entry     = entry; g_last_sl = sl; g_last_tp = tp; g_last_vol = lots_to_trade;
-      g_last_rr        = rr; g_last_conf_raw = conf_eff; g_last_conf_eff = conf_eff;
+      g_last_rr        = rr;    g_last_conf_raw = conf_eff; g_last_conf_eff = conf_eff;
       g_last_ze        = ze_strength; g_last_comment = comment;
-      
+
       if(Hybrid_RequireApproval)
       {
          if(g_lastBarTime != g_last_telegram_alert_bar)
@@ -1609,22 +1666,27 @@ if(signal > 0){ // buy
             SendTelegramAlert(signal_str, conf_eff, ze_strength, entry, sl, tp, rr, reason_code);
             g_last_telegram_alert_bar = g_lastBarTime;
          }
-         
-         if(EmitIntent(g_last_side, g_last_entry, g_last_sl, g_last_tp, g_last_vol, g_last_rr, conf_eff, conf_eff, g_last_ze)) 
+
+         if(EmitIntent(g_last_side, g_last_entry, g_last_sl, g_last_tp, g_last_vol, g_last_rr, conf_eff, conf_eff, g_last_ze))
             return false;
-         else 
+         else
             return false;
       }
-      
+
       g_last_send_sig_hash = sig_h;
-      g_last_send_ms = now_ms;
+      g_last_send_ms       = now_ms;
+
       trade.SetDeviationInPoints(MaxSlippagePoints);
-      bool order_sent = (signal > 0) ? trade.Buy(lots_to_trade, symbolName, 0, sl, tp, comment) : trade.Sell(lots_to_trade, symbolName, 0, sl, tp, comment);
+      bool order_sent = (signal > 0)
+                        ? trade.Buy(lots_to_trade, symbolName, 0.0, sl, tp, comment)
+                        : trade.Sell(lots_to_trade, symbolName, 0.0, sl, tp, comment);
+
       if(order_sent && (trade.ResultRetcode() == TRADE_RETCODE_DONE || trade.ResultRetcode() == TRADE_RETCODE_DONE_PARTIAL))
       {
          g_entries++;
          PrintFormat("%s Signal:%s → Executed %.2f lots @%.5f | SL:%.5f TP:%.5f",
-                EVT_ENTRY, signal_str, trade.ResultVolume(), trade.ResultPrice(), sl, tp);
+                     EVT_ENTRY, signal_str, trade.ResultVolume(), trade.ResultPrice(), sl, tp);
+
          double exec_lots = (trade.ResultVolume() > 0.0 ? trade.ResultVolume() : lots_to_trade);
          AAI_LogExec(signal > 0 ? +1 : -1, exec_lots);
 
@@ -1635,15 +1697,18 @@ if(signal > 0){ // buy
       }
       else
       {
-         if(g_lastBarTime != g_last_suppress_log_time){
+         if(g_lastBarTime != g_last_suppress_log_time)
+         {
             PrintFormat("%s reason=trade_send_failed details=retcode:%d", EVT_SUPPRESS, trade.ResultRetcode());
             g_last_suppress_log_time = g_lastBarTime;
          }
          return false;
       }
    }
+
    return false;
 }
+//+------------------------------------------------------------------+
 
 
 //+------------------------------------------------------------------+
