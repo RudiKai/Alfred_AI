@@ -10,6 +10,9 @@
 #property indicator_chart_window
 #property version "4.0"
 
+#property version   "4.2"
+#define SB_BUILD_TAG  "SB 4.2.0"
+
 // --- Indicator Buffers (Expanded to 7) ---
 #property indicator_buffers 7
 #property indicator_plots   7 // Must match buffer count for EA/iCustom access.
@@ -86,6 +89,12 @@ input double SB_SMC_FVG_MinPips = 1.0;
 input int    SB_SMC_OB_Lookback = 20;
 input int    SB_SMC_BOS_Lookback= 50;
 
+input group "--- Confidence Model ---"
+input int SB_BaseConf = 40;   // base confidence when a direction exists
+
+input group "--- Diagnostics ---"
+input bool SB_EnableDebug = true;   // toggle extra SignalBrain logging
+
 
 // --- Enums for Clarity ---
 enum ENUM_REASON_CODE
@@ -127,6 +136,12 @@ static datetime g_last_smc_fail_log_time = 0; // TICKET #1: Added for SMC
 //+------------------------------------------------------------------+
 int OnInit()
 {
+{
+   PrintFormat("[SB_INIT] %s file=%s now=%s",
+               SB_BUILD_TAG,
+               __FILE__,
+               TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS));
+}
     // --- Bind all 7 data buffers ---
     SetIndexBuffer(0, FinalSignalBuffer,      INDICATOR_DATA);
     SetIndexBuffer(1, FinalConfidenceBuffer,  INDICATOR_DATA);
@@ -269,110 +284,138 @@ int OnCalculate(const int rates_total,
             RawBCBiasBuffer[i] = 0;
         }
     }
-    else // Live Logic: MA Cross + Full Confluence Calculation
+else // Live Logic: MA Cross + Full Confluence Calculation
+{
+    for(int i = start_bar; i >= 1; --i)
     {
-        for(int i = start_bar; i >= 1; i--)
+        // --- Initialize outputs for this bar ---
+        double finalSignal       = 0.0;
+        double finalConfidence   = 0.0;
+        ENUM_REASON_CODE reasonCode = REASON_NONE;
+
+        double rawZEStrength     = 0.0;
+        double rawSMCSignal      = 0.0;
+        double rawSMCConfidence  = 0.0;
+        double rawBCBias         = 0.0;
+
+        // --- 1) Base Signal: MA Cross (closed bar) ---
+        double fast_arr[1], slow_arr[1];
+        if (CopyBuffer(fastMA_handle, 0, i, 1, fast_arr) > 0 &&
+            CopyBuffer(slowMA_handle, 0, i, 1, slow_arr) > 0)
         {
-            // --- Initialize outputs for this bar ---
-            double finalSignal = 0.0;
-            double finalConfidence = 0.0;
-            ENUM_REASON_CODE reasonCode = REASON_NONE;
-            
-            double rawZEStrength = 0.0;
-            double rawSMCSignal = 0.0;
-            double rawSMCConfidence = 0.0;
-            double rawBCBias = 0.0;
-
-
-            // --- 1. Base Signal: MA Cross ---
-            double fast_arr[1], slow_arr[1];
-            if (CopyBuffer(fastMA_handle, 0, i, 1, fast_arr) > 0 && CopyBuffer(slowMA_handle, 0, i, 1, slow_arr) > 0)
+            if(fast_arr[0] != 0.0 && slow_arr[0] != 0.0)
             {
-                if(fast_arr[0] > slow_arr[0] && fast_arr[0] != 0 && slow_arr[0] != 0) finalSignal = 1.0;
-                else if(fast_arr[0] < slow_arr[0] && fast_arr[0] != 0 && slow_arr[0] != 0) finalSignal = -1.0;
+                if(fast_arr[0] > slow_arr[0]) { finalSignal = +1.0; reasonCode = REASON_BUY_HTF_CONTINUATION; }
+                else if(fast_arr[0] < slow_arr[0]) { finalSignal = -1.0; reasonCode = REASON_SELL_HTF_CONTINUATION; }
             }
-
-            // --- 2. Base Confidence & Reason ---
-            if (finalSignal != 0.0)
-            {
-                finalConfidence = 50.0; // Base confidence for a clean cross is 50/100
-                reasonCode = (finalSignal > 0) ? REASON_BUY_HTF_CONTINUATION : REASON_SELL_HTF_CONTINUATION;
-            }
-
-            // --- 3. Read Raw Data from Foundational Indicators ---
-            // ZoneEngine
-            if(SB_UseZE && ZE_handle != INVALID_HANDLE)
-            {
-                double ze_arr[1];
-                if(CopyBuffer(ZE_handle, 0, i, 1, ze_arr) > 0) rawZEStrength = ze_arr[0];
-                else if(time[i] != g_last_ze_fail_log_time)
-                {
-                    PrintFormat("[DBG_SB_ZE] read failed on bar %s", TimeToString(time[i]));
-                    g_last_ze_fail_log_time = time[i];
-                }
-            }
-            
-            // BiasCompass
-            if(SB_UseBC && BC_handle != INVALID_HANDLE)
-            {
-                double bc_arr[1];
-                if(CopyBuffer(BC_handle, 0, i, 1, bc_arr) > 0) rawBCBias = bc_arr[0];
-                 else if(time[i] != g_last_bc_fail_log_time)
-                {
-                    PrintFormat("[DBG_SB_BC] read failed on bar %s", TimeToString(time[i]));
-                    g_last_bc_fail_log_time = time[i];
-                }
-            }
-
-            // SMC
-            if(SB_UseSMC && SMC_handle != INVALID_HANDLE)
-            {
-                double smc_sig_arr[1], smc_conf_arr[1];
-                if(CopyBuffer(SMC_handle, 0, i, 1, smc_sig_arr) > 0) rawSMCSignal = smc_sig_arr[0];
-                if(CopyBuffer(SMC_handle, 1, i, 1, smc_conf_arr) > 0) rawSMCConfidence = smc_conf_arr[0];
-
-                if (rawSMCSignal == 0 && time[i] != g_last_smc_fail_log_time)
-                {
-                   PrintFormat("[DBG_SB_SMC] read failed on bar %s", TimeToString(time[i]));
-                   g_last_smc_fail_log_time = time[i];
-                }
-            }
-
-            // --- 4. Calculate Final Confidence with Bonuses ---
-            if(finalSignal != 0.0)
-            {
-                // ZE Bonus
-                if(SB_UseZE && rawZEStrength >= SB_MinZoneStrength)
-                {
-                    finalConfidence += SB_Bonus_ZE;
-                }
-                
-                // BC Bonus
-                bool isBullishBias = rawBCBias > 0.5;
-                bool isBearishBias = rawBCBias < -0.5;
-                if(SB_UseBC && ((finalSignal > 0 && isBullishBias) || (finalSignal < 0 && isBearishBias)))
-                {
-                    finalConfidence += SB_Bonus_BC;
-                }
-
-                // SMC Bonus
-                if(SB_UseSMC && ((finalSignal > 0 && rawSMCSignal > 0) || (finalSignal < 0 && rawSMCSignal < 0)))
-                {
-                    finalConfidence += SB_Bonus_SMC;
-                }
-            }
-
-
-            // --- 5. Finalize and Write ALL Buffers for the closed bar ---
-            FinalSignalBuffer[i]      = finalSignal;
-            FinalConfidenceBuffer[i]  = fmin(100.0, finalConfidence); // Clamp confidence to [0, 100]
-            ReasonCodeBuffer[i]       = (double)reasonCode;
-            RawZEStrengthBuffer[i]    = rawZEStrength;
-            RawSMCSignalBuffer[i]     = rawSMCSignal;
-            RawSMCConfidenceBuffer[i] = rawSMCConfidence;
-            RawBCBiasBuffer[i]        = rawBCBias;
         }
+
+        // --- 2) Read Raw Data from Foundational Indicators (closed bar) ---
+
+        // ZoneEngine (strength)
+        if(SB_UseZE && ZE_handle != INVALID_HANDLE)
+        {
+            double ze_arr[1];
+            if(CopyBuffer(ZE_handle, 0, i, 1, ze_arr) > 0)
+                rawZEStrength = ze_arr[0];
+            else if(time[i] != g_last_ze_fail_log_time)
+            {
+                PrintFormat("[DBG_SB_ZE] read failed on bar %s", TimeToString(time[i]));
+                g_last_ze_fail_log_time = time[i];
+            }
+        }
+
+        // BiasCompass (bias as -1..+1 style value)
+        if(SB_UseBC && BC_handle != INVALID_HANDLE)
+        {
+            double bc_arr[1];
+            if(CopyBuffer(BC_handle, 0, i, 1, bc_arr) > 0)
+                rawBCBias = bc_arr[0];
+            else if(time[i] != g_last_bc_fail_log_time)
+            {
+                PrintFormat("[DBG_SB_BC] read failed on bar %s", TimeToString(time[i]));
+                g_last_bc_fail_log_time = time[i];
+            }
+        }
+
+        // SMC (signal & confidence 0..10)
+        if(SB_UseSMC && SMC_handle != INVALID_HANDLE)
+        {
+            double smc_sig_arr[1], smc_conf_arr[1];
+            if(CopyBuffer(SMC_handle, 0, i, 1, smc_sig_arr) > 0)
+                rawSMCSignal = smc_sig_arr[0];
+            if(CopyBuffer(SMC_handle, 1, i, 1, smc_conf_arr) > 0)
+                rawSMCConfidence = smc_conf_arr[0];
+        }
+
+        // --- 3) Final Confidence: base + explicit bonuses (clamped 0..100) ---
+        double base_conf = 0.0, bc_bonus = 0.0, ze_bonus = 0.0, smc_bonus = 0.0;
+
+        if(finalSignal != 0.0)
+        {
+            // base
+            base_conf = (double)SB_BaseConf;
+
+            // BC bonus (boolean alignment)
+            bool isBullishBias = (rawBCBias >  0.5);
+            bool isBearishBias = (rawBCBias < -0.5);
+            if(SB_UseBC && ((finalSignal > 0 && isBullishBias) || (finalSignal < 0 && isBearishBias)))
+                bc_bonus = (double)SB_Bonus_BC;
+
+            // ZE bonus (scaled by strength above threshold up to 10)
+            if(SB_UseZE && rawZEStrength >= SB_MinZoneStrength)
+            {
+                double denom   = MathMax(1.0, 10.0 - (double)SB_MinZoneStrength);
+                double zescale = MathMin(1.0, MathMax(0.0, (rawZEStrength - SB_MinZoneStrength) / denom));
+                ze_bonus = (double)SB_Bonus_ZE * zescale;
+            }
+
+            // SMC bonus (alignment × confidence 0..10)
+            if(SB_UseSMC && rawSMCSignal != 0.0 && (finalSignal * rawSMCSignal) > 0.0)
+            {
+                double smcScale = MathMin(1.0, MathMax(0.0, rawSMCConfidence / 10.0));
+                smc_bonus = (double)SB_Bonus_SMC * smcScale;
+            }
+
+            finalConfidence = base_conf + bc_bonus + ze_bonus + smc_bonus;
+
+            // ---- SANITY: if no bonuses applied but conf somehow != base, force it & report ----
+            if(MathAbs(bc_bonus) < 1e-9 && MathAbs(ze_bonus) < 1e-9 && MathAbs(smc_bonus) < 1e-9)
+            {
+                if(MathAbs(finalConfidence - base_conf) > 1e-9)
+                {
+                    PrintFormat("[SB_SANITY] bonuses=0 but conf=%.1f, forcing to base=%.1f at %s",
+                                finalConfidence, base_conf, TimeToString(time[i]));
+                    finalConfidence = base_conf;
+                }
+            }
+        }
+        else
+        {
+            finalConfidence = 0.0;
+            reasonCode = REASON_NONE;
+        }
+
+        // --- DEBUG: one-line breakdown (only if SB_EnableDebug) ---
+        if(SB_EnableDebug)
+        {
+            PrintFormat("[SB_CONF] t=%s sig=%+.0f base=%.1f bc+=%.1f ze+=%.1f smc+=%.1f -> conf=%.1f | raw: ze=%.1f bc=%.1f smc_s=%.1f smc_c=%.1f",
+                        TimeToString(time[i]),
+                        finalSignal, base_conf, bc_bonus, ze_bonus, smc_bonus, finalConfidence,
+                        rawZEStrength, rawBCBias, rawSMCSignal, rawSMCConfidence);
+        }
+
+        // --- 4) Finalize and write ALL buffers for the closed bar ---
+        FinalSignalBuffer[i]      = finalSignal;
+        FinalConfidenceBuffer[i]  = MathMin(100.0, MathMax(0.0, finalConfidence));
+        ReasonCodeBuffer[i]       = (double)reasonCode;
+        RawZEStrengthBuffer[i]    = rawZEStrength;
+        RawSMCSignalBuffer[i]     = rawSMCSignal;
+        RawSMCConfidenceBuffer[i] = rawSMCConfidence;
+        RawBCBiasBuffer[i]        = rawBCBias;
     }
+}
+
 
     // --- Mirror the last closed bar (shift=1) to the current bar (shift=0) for EA access ---
     if (rates_total > 1)
