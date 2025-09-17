@@ -48,14 +48,14 @@ int    AAI_dur_count   = 0;
 // ==================== /AAI METRICS ======================
 //+------------------------------------------------------------------+
 //| AAI_EA_Trade_Manager.mq5                                         |
-//|                    v5.1 - Global Risk Guard                      |
+//|                    v5.2.1 - Compile Fixes                        |
 //|                                                                  |
 //| (Consumes all data from the refactored AAI_Indicator_SignalBrain)|
 //|                                                                  |
 //| Copyright 2025, AlfredAI Project                                 |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "5.1"
+#property version   "5.21"
 #property description "Manages trades based on signals from the central SignalBrain indicator."
 #include <Trade\Trade.mqh>
 #include <Arrays\ArrayLong.mqh>
@@ -440,6 +440,20 @@ input ENUM_RG_BlockUntil InpRG_BlockUntil     = RG_BLOCK_TIL_END_OF_DAY;
 input int          InpRG_BlockHours           = 4;
 input int          InpRG_PrefPenalty          = 5;
 
+// --- Order Send Robustness & Retry (T031) ---
+input group "Order Send Robustness & Retry"
+input bool   InpOSR_Enable            = true;
+input int    InpOSR_MaxRetries        = 2;
+input int    InpOSR_RetryDelayMs      = 250;
+input bool   InpOSR_RepriceOnRetry    = true;
+input int    InpOSR_SlipPtsInitial    = 5;
+input int    InpOSR_SlipPtsStep       = 5;
+input int    InpOSR_SlipPtsMax        = 25;
+enum ENUM_OSR_PriceMode { OSR_USE_LAST=0, OSR_USE_CURRENT=1 };
+input ENUM_OSR_PriceMode InpOSR_PriceMode = OSR_USE_CURRENT;
+input bool   InpOSR_AllowIOC          = true;
+input bool   InpOSR_LogVerbose        = false;
+
 //--- Confluence Module Inputs (M15 Baseline) ---
 input group "Confluence Modules"
 input ENUM_BC_ALIGN_MODE BC_AlignMode   = BC_REQUIRED;
@@ -821,6 +835,11 @@ void DJ_Write(const int direction,
               const int as_hist_n,
               const int imc_flag,
               const double imc_support,
+              const int rg_flag,
+              const double rg_dd_pct,
+              const double rg_dd_abs,
+              const int rg_sls,
+              const int rg_seq,
               const double spread_pts,
               const double lots,
               const double sl_pts,
@@ -837,7 +856,7 @@ void DJ_Write(const int direction,
   // Write header if file is empty or we’re not appending
   if(FileSize(h) == 0 || !InpDJ_Append){
     FileSeek(h, 0, SEEK_SET);
-    string header = "time,symbol,tf,dir,conf,sb_reason,ze_strength,bc_bias,smc_sig,smc_conf,vr_flag,news_flag,sp_flag,as_flag,as_cap_pts,as_histN,imc_flag,imc_support,spread_pts,lots,sl_pts,tp_pts,rr,entry_mode\r\n";
+    string header = "time,symbol,tf,dir,conf,sb_reason,ze_strength,bc_bias,smc_sig,smc_conf,vr_flag,news_flag,sp_flag,as_flag,as_cap_pts,as_histN,imc_flag,imc_support,rg_flag,rg_dd_pct,rg_dd_abs,rg_sls,rg_seq,spread_pts,lots,sl_pts,tp_pts,rr,entry_mode\r\n";
     FileWriteString(h, header);
   }
 
@@ -847,7 +866,7 @@ void DJ_Write(const int direction,
   datetime t = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1); // closed bar time
   string tf  = TfLabel((ENUM_TIMEFRAMES)SignalTimeframe);
 
-  string row = StringFormat("%s,%s,%s,%d,%.0f,%d,%.1f,%d,%d,%.1f,%d,%d,%d,%d,%.0f,%d,%d,%.2f,%.0f,%.2f,%.0f,%.0f,%.2f,%s\r\n",
+  string row = StringFormat("%s,%s,%s,%d,%.0f,%d,%.1f,%d,%d,%.1f,%d,%d,%d,%d,%.0f,%d,%d,%.2f,%d,%.2f,%.2f,%d,%d,%.0f,%.2f,%.0f,%.0f,%.2f,%s\r\n",
     TimeToString(t, TIME_DATE|TIME_SECONDS),
     _Symbol,
     tf,
@@ -866,6 +885,11 @@ void DJ_Write(const int direction,
     as_hist_n,
     imc_flag,
     imc_support,
+    rg_flag,
+    rg_dd_pct,
+    rg_dd_abs,
+    rg_sls,
+    rg_seq,
     spread_pts,
     lots,
     sl_pts,
@@ -1078,6 +1102,149 @@ void RG_ResetDay()
     PrintFormat("[RISK_GUARD] Day rolled over. Anchor: %s, Start Balance: %.2f", TimeToString(g_rg_day_anchor_time), g_rg_day_start_balance);
 }
 
+
+//+------------------------------------------------------------------+
+//| >>> T031: Order Send Robustness Helpers <<<                      |
+//+------------------------------------------------------------------+
+double NormalizeLots(double lots)
+{
+  double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+  double minv = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+  double maxv = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+  lots = MathMax(minv, MathMin(maxv, MathFloor(lots/step + 0.5) * step));
+  return lots;
+}
+
+double NormalizePriceByTick(double price)
+{
+  double tick = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+  if(tick <= 0.0) return NormalizeDouble(price, _Digits);
+  // Snap to tick grid
+  double n = MathRound(price / tick);
+  return n * tick;
+}
+
+// Ensure SL/TP meet min stop & freeze constraints; push them away if needed.
+// Returns true if OK; false if cannot satisfy constraints.
+bool EnsureStopsDistance(const int direction, double &price, double &sl, double &tp)
+{
+  // Min stop distance in points
+  int stops_level_pts = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+  double min_stop_dist = (double)stops_level_pts * _Point;
+
+  // For market orders, compare to current bid/ask
+  if(direction > 0) // BUY
+  {
+    if(sl > 0 && (price - sl) < min_stop_dist) sl = price - min_stop_dist;
+    if(tp > 0 && (tp - price) < min_stop_dist) tp = price + min_stop_dist;
+  }
+  else // SELL
+  {
+    if(sl > 0 && (sl - price) < min_stop_dist) sl = price + min_stop_dist;
+    if(tp > 0 && (price - tp) < min_stop_dist) tp = price - min_stop_dist;
+  }
+
+  // Normalize to tick grid
+  if(sl > 0) sl = NormalizePriceByTick(sl);
+  if(tp > 0) tp = NormalizePriceByTick(tp);
+  price = NormalizePriceByTick(price);
+
+  // Basic sanity
+  if(direction > 0 && sl > 0 && sl >= price) return false;
+  if(direction > 0 && tp > 0 && tp <= price) return false;
+  if(direction < 0 && sl > 0 && sl <= price) return false;
+  if(direction < 0 && tp > 0 && tp >= price) return false;
+
+  return true;
+}
+
+// Retryable retcodes set (MT5). We retry only on transient price/flow issues.
+bool OSR_IsRetryable(const uint retcode)
+{
+  switch(retcode)
+  {
+    case TRADE_RETCODE_REQUOTE:
+    case TRADE_RETCODE_PRICE_OFF:
+    case TRADE_RETCODE_REJECT:
+    // Non-standard but common retcodes for transient issues
+    case 10025: // TRADE_RETCODE_NO_CONNECTION
+    case 10026: // TRADE_RETCODE_TRADE_CONTEXT_BUSY
+      return true;
+  }
+  return false;
+}
+
+//+------------------------------------------------------------------+
+//| >>> T031: Core OSR Sender <<<                                    |
+//+------------------------------------------------------------------+
+bool OSR_SendMarket(const int direction,
+                    double lots,
+                    double &price_io,
+                    double &sl_io,
+                    double &tp_io,
+                    MqlTradeResult &lastRes)
+{
+  if(!InpOSR_Enable){
+    // Single attempt using CTrade
+    trade.SetDeviationInPoints(InpOSR_SlipPtsInitial);
+    bool order_sent = (direction > 0)
+                      ? trade.Buy(lots, _Symbol, 0.0, sl_io, tp_io, g_last_comment)
+                      : trade.Sell(lots, _Symbol, 0.0, sl_io, tp_io, g_last_comment);
+    trade.Result(lastRes);
+    return order_sent;
+  }
+
+  int retries = MathMax(0, InpOSR_MaxRetries);
+  int deviation = MathMax(0, InpOSR_SlipPtsInitial);
+
+  for(int attempt=0; attempt<=retries; ++attempt)
+  {
+    if(InpOSR_RepriceOnRetry || attempt==0 || InpOSR_PriceMode==OSR_USE_CURRENT)
+    {
+      price_io = (direction>0 ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID));
+    }
+
+    int dev_use = MathMin(deviation, InpOSR_SlipPtsMax);
+
+    MqlTradeRequest req={};
+    ZeroMemory(req);
+    ZeroMemory(lastRes);
+
+    req.action   = TRADE_ACTION_DEAL;
+    req.symbol   = _Symbol;
+    req.volume   = NormalizeLots(lots);
+    req.type     = (direction>0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
+    req.type_filling = (InpOSR_AllowIOC ? ORDER_FILLING_IOC : ORDER_FILLING_FOK);
+    req.deviation    = (ulong)dev_use;
+    req.magic = MagicNumber;
+    req.comment = g_last_comment;
+
+    double p = price_io, sl=sl_io, tp=tp_io;
+    if(!EnsureStopsDistance(direction, p, sl, tp)){
+      if(InpOSR_LogVerbose) Print("[OSR] stops violate constraints; giving up.");
+      return false;
+    }
+    req.price = p; req.sl = sl; req.tp = tp;
+
+    if(OrderSend(req, lastRes) && (lastRes.retcode == TRADE_RETCODE_DONE || lastRes.retcode == TRADE_RETCODE_DONE_PARTIAL))
+    {
+      price_io = p; sl_io = sl; tp_io = tp;
+      return true;
+    }
+
+    if(InpOSR_LogVerbose)
+      PrintFormat("[OSR] OrderSend fail (attempt %d): ret=%u, dev=%d, price=%.5f",
+                  attempt, lastRes.retcode, dev_use, p);
+
+    if(!OSR_IsRetryable(lastRes.retcode))
+      return false;
+
+    deviation += InpOSR_SlipPtsStep;
+    if(InpOSR_RetryDelayMs > 0) Sleep(InpOSR_RetryDelayMs);
+  }
+
+  return false;
+}
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                            |
@@ -2337,213 +2504,66 @@ void SendTelegramAlert(const string side, const double conf_eff, const double ze
 //+------------------------------------------------------------------+
 bool TryOpenPosition(int signal, double conf_eff, int reason_code, double ze_strength, int bc_bias, int smc_sig, double smc_conf, string entry_mode)
 {
-   // ----- tick / basics -----
-   MqlTick t;
-   if(!SymbolInfoTick(_Symbol, t) || t.time_msc == 0){ return false; }
-
-   const int    digs          = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-   const double pt         = _Point;
-   const double pip_size      = PipSize();
-   const double min_stop_dist = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL)  * pt;
-
    // ----- ATR for SL distance (closed bar), with defensive read -----
    double atr_val_raw = 0.0;
-   {
-      double _tmp_atr_entry_[1];
-      if(CopyBuffer(g_hATR, 0, 1, 1, _tmp_atr_entry_) == 1) atr_val_raw = _tmp_atr_entry_[0];
-      else atr_val_raw = 0.0;
-   }
-
-   // Base SL distance: ATR + buffer, but never less than broker min stop distance
-   const double sl_dist_raw = atr_val_raw + (SL_Buffer_Points * point);
-   const double sl_dist     = MathMax(sl_dist_raw, min_stop_dist);
-
-   // ----- entry / initial SL-TP based on signal & settings -----
-   const double entry = (signal > 0 ? t.ask : t.bid);
-   double sl = 0.0, tp = 0.0;
-   double rr = 0.0;
-
-   if(signal > 0) // BUY
-   {
-      sl = NormalizeDouble(entry - sl_dist, digs);
-
-      if(Exit_FixedRR)
-      {
-         const double risk_dist = MathMax(entry - sl, min_stop_dist);
-         tp = NormalizeDouble(entry + Fixed_RR * risk_dist, digs);
-         rr = Fixed_RR;
-      }
-      else
-      {
-         tp = 0.0;
-      }
-   }
-   else if(signal < 0) // SELL
-   {
-      sl = NormalizeDouble(entry + sl_dist, digs);
-
-      if(Exit_FixedRR)
-      {
-         const double risk_dist = MathMax(sl - entry, min_stop_dist);
-         tp = NormalizeDouble(entry - Fixed_RR * risk_dist, digs);
-         rr = Fixed_RR;
-      }
-      else
-      {
-         tp = 0.0;
-      }
-   }
-   else
-   {
-      return false;
-   }
-
-   // ----- safety clamp vs broker Stops Level (belt & suspenders) -----
-   if(signal > 0) // BUY
-   {
-      if(sl > 0.0 && (entry - sl) < min_stop_dist) sl = NormalizeDouble(entry - min_stop_dist, digs);
-      if(Exit_FixedRR && tp > 0.0 && (tp - entry) < min_stop_dist) tp = NormalizeDouble(entry + min_stop_dist, digs);
-   }
-   else // SELL
-   {
-      if(sl > 0.0 && (sl - entry) < min_stop_dist) sl = NormalizeDouble(entry + min_stop_dist, digs);
-      if(Exit_FixedRR && tp > 0.0 && (entry - tp) < min_stop_dist) tp = NormalizeDouble(entry - min_stop_dist, digs);
-   }
-
-   // ----- Duplicate Guard (MS) -----
-   ulong now_ms = GetTickCount64();
-   datetime current_bar_time = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1);
-   string   hash_str = StringFormat("%I64d|%d|%.*f", (long)current_bar_time, signal, digs, entry);
-   ulong    sig_h    = StringToULongHash(hash_str);
-   if(DuplicateGuardMs > 0 && g_last_send_sig_hash == sig_h && (now_ms - g_last_send_ms) < DuplicateGuardMs)
-      return false;
-
-   // ----- Stop Level validation before sizing -----
-   bool ok_side = (signal > 0) ? (sl < entry) : (entry < sl);
-   if (tp != 0.0) ok_side &= (signal > 0) ? (entry < tp) : (tp < entry);
-
-   bool ok_dist = (MathAbs(entry - sl) >= min_stop_dist);
-   if(tp != 0.0) ok_dist &= (MathAbs(tp - entry) >= min_stop_dist);
-
-   if(!ok_side || !ok_dist) return false;
-
+   double _tmp_atr_entry_[1];
+   if(CopyBuffer(g_hATR, 0, 1, 1, _tmp_atr_entry_) == 1) atr_val_raw = _tmp_atr_entry_[0];
+   
+   double sl_dist_raw = atr_val_raw + (SL_Buffer_Points * point);
+   double sl_dist = MathMax(sl_dist_raw, (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * point);
+   
    // ----- lot sizing based on actual risk distance -----
-   double lots_to_trade = CalculateLotSize((int)conf_eff, MathAbs(entry - sl));
+   double lots_to_trade = CalculateLotSize((int)conf_eff, sl_dist);
    if(lots_to_trade < MinLotSize) return false;
 
-   // T026: Decision Journaling Hook
-   double sl_pts = MathAbs(entry-sl) / point;
-   double tp_pts = (tp > 0) ? MathAbs(entry-tp) / point : -1.0;
-   double rr_calc = (sl_pts > 0 && tp_pts > 0) ? (tp_pts / sl_pts) : -1.0;
+   double entryPrice = 0; // OSR will populate this
+   double slPrice, tpPrice;
+
+   // Set SL/TP based on an initial price estimate; OSR will refine it
+   double estimated_entry = (signal > 0) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if (signal > 0) {
+      slPrice = estimated_entry - sl_dist;
+      tpPrice = (Exit_FixedRR) ? estimated_entry + Fixed_RR * sl_dist : 0;
+   } else {
+      slPrice = estimated_entry + sl_dist;
+      tpPrice = (Exit_FixedRR) ? estimated_entry - Fixed_RR * sl_dist : 0;
+   }
+   
+   g_last_comment = StringFormat("AAI|%.1f|%d|%d|%.1f|%.5f|%.5f|%.1f",
+                                 conf_eff, (int)conf_eff, reason_code, ze_strength, slPrice, tpPrice, smc_conf);
+                                 
+   double rr_calc = (sl_dist > 0 && tpPrice > 0) ? (MathAbs(tpPrice-estimated_entry)/sl_dist) : 0.0;
    
    DJ_Write(signal, conf_eff, reason_code, ze_strength, bc_bias, smc_sig, smc_conf, 
-        g_vr_flag_for_bar, g_news_flag_for_bar, g_sp_hit_for_bar ? 1 : 0, 
-        g_as_exceeded_for_bar ? 1 : 0, g_as_cap_pts_last, g_as_hist_count,
-        g_imc_flag_for_bar ? 1 : 0, g_imc_support,
-        (double)CurrentSpreadPoints(), 
-        lots_to_trade, sl_pts, tp_pts, rr_calc, entry_mode);
+            g_vr_flag_for_bar, g_news_flag_for_bar, g_sp_hit_for_bar ? 1 : 0, 
+            g_as_exceeded_for_bar ? 1 : 0, g_as_cap_pts_last, g_as_hist_count,
+            g_imc_flag_for_bar ? 1 : 0, g_imc_support,
+            g_rg_flag_for_bar ? 1:0, 
+            (g_rg_day_start_balance > 0 ? (-g_rg_day_realized_pl / g_rg_day_start_balance) * 100.0 : 0.0),
+            -g_rg_day_realized_pl, g_rg_day_sl_hits, g_rg_consec_losses,
+            (double)CurrentSpreadPoints(), 
+            lots_to_trade, sl_dist / point, (tpPrice>0?MathAbs(tpPrice-estimated_entry)/point:0), rr_calc, entry_mode);
 
+   MqlTradeResult tRes;
+   bool sent = OSR_SendMarket(signal, lots_to_trade, entryPrice, slPrice, tpPrice, tRes);
 
-   string signal_str = (signal == 1) ? "BUY" : "SELL";
-   string comment = StringFormat("AAI|%.1f|%d|%d|%.1f|%.5f|%.5f|%.1f",
-                                 conf_eff, (int)conf_eff, reason_code, ze_strength, sl, tp, smc_conf);
-
-   // ----- idea log (now with final, clamped SL/TP) -----
-   PrintFormat("%s dir=%s entry=%.5f sl=%.5f tp=%.5f R=%.2f conf=%.0f ze=%.1f",
-               EVT_IDEA, signal_str, entry, sl, tp, rr, conf_eff, ze_strength);
-
-   // ----- T007: Manual Approval Gate -----
-   if(ExecutionMode == AutoExecute && ApprovalMode == Manual)
-   {
-       datetime barTime = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1);
-       string   gv_key  = StringFormat("AAI_APPROVE_%s_%d_%I64d", _Symbol, (int)SignalTimeframe, (long)barTime);
-
-       double approval_value = GlobalVariableGet(gv_key);
-       if(approval_value != 1.0)
-       {
-           static datetime last_approval_wait_log = 0;
-           if(barTime != last_approval_wait_log)
-           {
-               PrintFormat("[WAIT_APPROVAL] key=%s", gv_key);
-               last_approval_wait_log = barTime;
-           }
-           if(g_stamp_approval != g_sb.closed_bar_time){ g_stamp_approval = g_sb.closed_bar_time; }
-           return false;
-       }
-       g_entries++;
-       GlobalVariableSet(gv_key, 0.0);
-       PrintFormat("[CONSUMED_APPROVAL] %s reset to 0.0", gv_key);
+   if(!sent){
+     PrintFormat("[AAI_SENDFAIL] retcode=%u lots=%.2f dir=%d", tRes.retcode, lots_to_trade, signal);
+     return false;
    }
 
-   // ----- HYBRID HOURS SWITCH -----
-   if(!AAI_HourDayAutoOK())
-   {
-      double smc_conf_val = 0.0;
-      Read1(sb_handle, SB_BUF_SMC_CONF, MathMax(1, SB_ReadShift), smc_conf_val, "SB_SMC_Alert");
+   // --- Post-open bookkeeping ---
+   g_entries++;
+   PrintFormat("%s Signal:%s → Executed %.2f lots @%.5f | SL:%.5f TP:%.5f",
+               EVT_ENTRY, (signal > 0 ? "BUY":"SELL"), tRes.volume, tRes.price, slPrice, tpPrice);
 
-      int    spread_pts_now = CurrentSpreadPoints();
-      double atr_pips   = (pip_size > 0.0 ? atr_val_raw / pip_size : 0.0);
-      AAI_RaiseHybridAlert(signal_str, conf_eff, ze_strength, smc_conf_val, spread_pts_now, atr_pips, entry, sl, tp);
-      if(g_stamp_hyb != g_sb.closed_bar_time){ g_stamp_hyb = g_sb.closed_bar_time; }
-      return false;
-   }
+   AAI_LogExec(signal, tRes.volume > 0 ? tRes.volume : lots_to_trade);
 
-   // ----- send order (AutoExecute path) -----
-   if(ExecutionMode == AutoExecute)
-   {
-      g_last_side      = signal_str;
-      g_last_entry     = entry; g_last_sl = sl; g_last_tp = tp; g_last_vol = lots_to_trade;
-      g_last_rr        = rr;    g_last_conf_raw = conf_eff; g_last_conf_eff = conf_eff;
-      g_last_ze        = ze_strength; g_last_comment = comment;
+   datetime current_bar_time = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1);
+   if(signal > 0) g_last_entry_bar_buy = current_bar_time;
+   else           g_last_entry_bar_sell = current_bar_time;
 
-      if(Hybrid_RequireApproval)
-      {
-         if(g_lastBarTime != g_last_telegram_alert_bar)
-         {
-            SendTelegramAlert(signal_str, conf_eff, ze_strength, entry, sl, tp, rr, reason_code);
-            g_last_telegram_alert_bar = g_lastBarTime;
-         }
-
-         if(EmitIntent(g_last_side, g_last_entry, g_last_sl, g_last_tp, g_last_vol, g_last_rr, conf_eff, conf_eff, g_last_ze))
-            return false;
-         else
-            return false;
-      }
-
-      g_last_send_sig_hash = sig_h;
-      g_last_send_ms       = now_ms;
-
-      trade.SetDeviationInPoints(MaxSlippagePoints);
-      bool order_sent = (signal > 0)
-                        ? trade.Buy(lots_to_trade, symbolName, 0.0, sl, tp, comment)
-                        : trade.Sell(lots_to_trade, symbolName, 0.0, sl, tp, comment);
-
-      if(order_sent && (trade.ResultRetcode() == TRADE_RETCODE_DONE || trade.ResultRetcode() == TRADE_RETCODE_DONE_PARTIAL))
-      {
-         g_entries++;
-         PrintFormat("%s Signal:%s → Executed %.2f lots @%.5f | SL:%.5f TP:%.5f",
-                     EVT_ENTRY, signal_str, trade.ResultVolume(), trade.ResultPrice(), sl, tp);
-
-         double exec_lots = (trade.ResultVolume() > 0.0 ? trade.ResultVolume() : lots_to_trade);
-         AAI_LogExec(signal > 0 ? +1 : -1, exec_lots);
-
-         if(signal > 0) g_last_entry_bar_buy = current_bar_time;
-         else           g_last_entry_bar_sell = current_bar_time;
-
-         return true;
-      }
-      else
-      {
-         if(g_lastBarTime != g_last_suppress_log_time)
-         {
-            PrintFormat("%s reason=trade_send_failed details=retcode:%d", EVT_SUPPRESS, trade.ResultRetcode());
-            g_last_suppress_log_time = g_lastBarTime;
-         }
-         return false;
-      }
-   }
-
-   return false;
+   return true;
 }
 //+------------------------------------------------------------------+
 
