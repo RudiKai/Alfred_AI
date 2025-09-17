@@ -48,17 +48,18 @@ int    AAI_dur_count   = 0;
 // ==================== /AAI METRICS ======================
 //+------------------------------------------------------------------+
 //| AAI_EA_Trade_Manager.mq5                                         |
-//|           v4.4 - SB Confluence Model Control                     |
+//|                    v4.5 - News Gate Added                        |
 //|                                                                  |
 //| (Consumes all data from the refactored AAI_Indicator_SignalBrain)|
 //|                                                                  |
 //| Copyright 2025, AlfredAI Project                                 |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "4.4"
+#property version   "4.5"
 #property description "Manages trades based on signals from the central SignalBrain indicator."
 #include <Trade\Trade.mqh>
 #include <Arrays\ArrayLong.mqh>
+#include <AAI/AAI_Include_News.mqh>
 
 #define EVT_INIT  "[INIT]"
 #define EVT_BAR   "[BAR]"
@@ -363,6 +364,17 @@ enum ENUM_VR_Mode { VR_OFF=0, VR_REQUIRED=1, VR_PREFERRED=2 };
 input ENUM_VR_Mode InpVR_Mode = VR_REQUIRED;
 input int    InpVR_PrefPenalty = 4;
 
+//--- News/Event Gate Inputs (T024) ---
+input group "News/Event Gate"
+input bool   InpNews_Enable         = false;
+input string InpNews_CsvName        = "AAI_News.csv";   // From Common Files
+input ENUM_NEWS_Mode InpNews_Mode   = NEWS_REQUIRED;
+input bool   InpNews_TimesAreUTC    = true;
+input bool   InpNews_FilterHigh     = true;
+input bool   InpNews_FilterMedium   = true;
+input bool   InpNews_FilterLow      = false;
+input int    InpNews_PrefPenalty    = 5;
+
 
 //--- Confluence Module Inputs (M15 Baseline) ---
 input group "Confluence Modules"
@@ -388,6 +400,7 @@ string    symbolName;
 double    point;
 static ulong g_logged_positions[]; // For duplicate journal entry prevention
 int       g_logged_positions_total = 0;
+AAI_NewsGate g_newsGate;
 // --- T011: Over-extension State ---
 static int g_overext_wait = 0;
 // --- TICKET #3: Over-extension timing fix ---
@@ -421,6 +434,7 @@ static long g_blk_over     = 0;
 static long g_blk_spread   = 0;
 static long g_blk_smc      = 0;
 static long g_blk_vr       = 0; // T022: New counter
+static long g_blk_news     = 0;
 static bool g_summary_printed = false;
 // --- Once-per-bar stamps for block counters ---
 datetime g_stamp_conf  = 0;
@@ -434,6 +448,7 @@ datetime g_stamp_cool  = 0;
 datetime g_stamp_bar   = 0;
 datetime g_stamp_smc   = 0;
 datetime g_stamp_vr    = 0; // T022: New stamp
+datetime g_stamp_news  = 0;
 datetime g_stamp_none  = 0;
 datetime g_stamp_approval = 0;
 
@@ -452,7 +467,7 @@ datetime g_stamp_hyb = 0;     // once-per-bar stamp
 void PrintSummary()
 {
     if(g_summary_printed) return;
-    PrintFormat("AAI_SUMMARY|entries=%d|wins=%d|losses=%d|ze_blk=%d|bc_blk=%d|smc_blk=%d|overext_blk=%d|spread_blk=%d|vr_blk=%d",
+    PrintFormat("AAI_SUMMARY|entries=%d|wins=%d|losses=%d|ze_blk=%d|bc_blk=%d|smc_blk=%d|overext_blk=%d|spread_blk=%d|vr_blk=%d|news_blk=%d",
                 g_entries,
                 g_wins,
                 g_losses,
@@ -461,7 +476,8 @@ void PrintSummary()
                 g_blk_smc,
                 g_blk_over,
                 g_blk_spread,
-                g_blk_vr);
+                g_blk_vr,
+                g_blk_news);
     g_summary_printed = true;
 }
 
@@ -845,6 +861,10 @@ void AAI_Block(const string reason)
    {
       if(g_stamp_over != g_lastBarTime){ g_blk_over++; g_stamp_over = g_lastBarTime; }
    }
+   else if(r == "news")
+   {
+      if(g_stamp_news != g_lastBarTime){ g_blk_news++; g_stamp_news = g_lastBarTime; }
+   }
    else if(r == "confidence")
    {
       if(g_stamp_conf != g_lastBarTime){ g_stamp_conf = g_lastBarTime; }
@@ -970,6 +990,7 @@ int OnInit()
    g_blk_smc = 0;
    g_blk_over = 0;
    g_blk_spread = 0;
+   g_blk_news = 0;
    g_summary_printed = false;
    g_sb.valid = false; // Initialize cache as invalid
 
@@ -1030,6 +1051,10 @@ if(sb_handle == INVALID_HANDLE)
       for(int h=0;h<24;++h){ if(g_auto_hour_mask[h]){ ++cnt; hrs += IntegerToString(h) + " "; } }
       PrintFormat("[HYBRID_INIT] AutoHourRanges='%s' hours_on=%d [%s]", AutoHourRanges, cnt, hrs);
    }
+   
+   // --- Initialize News Gate ---
+   g_newsGate.Init(InpNews_Enable, InpNews_CsvName, InpNews_Mode, InpNews_TimesAreUTC,
+                   InpNews_FilterHigh, InpNews_FilterMedium, InpNews_FilterLow, InpNews_PrefPenalty);
 
    // --- T006: Create HUD Object ---
    ObjectCreate(0, HUD_OBJECT_NAME, OBJ_LABEL, 0, 0, 0);
@@ -1393,6 +1418,14 @@ void CheckForNewTrades()
        return;
    }
    
+   // --- News Gate (T024) ---
+   datetime server_now = TimeCurrent();
+   if(!g_newsGate.CheckGate(server_now, final_conf))
+   {
+      AAI_Block("news");
+      return;
+   }
+
    // --- Signal Gate ---
    if(direction == 0) return;
 
