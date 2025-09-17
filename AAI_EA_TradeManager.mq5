@@ -48,16 +48,17 @@ int    AAI_dur_count   = 0;
 // ==================== /AAI METRICS ======================
 //+------------------------------------------------------------------+
 //| AAI_EA_Trade_Manager.mq5                                         |
-//|                    v5.4 - SL/TP Safety & Auto-Adjust             |
+//|                    v5.5 - Post-Fill Harmonizer                   |
 //|                                                                  |
 //| (Consumes all data from the refactored AAI_Indicator_SignalBrain)|
 //|                                                                  |
 //| Copyright 2025, AlfredAI Project                                 |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "5.4"
+#property version   "5.5"
 #property description "Manages trades based on signals from the central SignalBrain indicator."
 #include <Trade\Trade.mqh>
+#include <Arrays\ArrayObj.mqh>
 #include <Arrays\ArrayLong.mqh>
 #include <AAI/AAI_Include_News.mqh>
 
@@ -233,6 +234,9 @@ enum ENUM_SLTA_Mode {
   SLTA_ADJUST_SL_ONLY=2,
   SLTA_SCALE_BOTH=3
 };
+// T034: Post-Fill Harmonizer Mode
+enum ENUM_HM_Mode { HM_OFF=0, HM_ONESHOT_IMMEDIATE=1, HM_DELAYED_RETRY=2 };
+
 
 //--- EA Inputs
 input ENUM_EXECUTION_MODE ExecutionMode = AutoExecute;
@@ -494,6 +498,18 @@ input int          InpSLTA_MaxTPPts       = 0;
 input bool         InpSLTA_StrictCancel   = true;
 input bool         InpSLTA_LogVerbose     = false;
 
+// --- Post-Fill Harmonizer (T034) ---
+input group "Post-Fill Harmonizer"
+input bool        InpHM_Enable          = true;
+input ENUM_HM_Mode InpHM_Mode           = HM_DELAYED_RETRY;
+input int         InpHM_DelayMs         = 300;
+input int         InpHM_MaxRetries      = 3;
+input int         InpHM_BackoffMs       = 400;
+input int         InpHM_MinChangePts    = 2;
+input bool        InpHM_RespectFreeze   = true;
+input bool        InpHM_LogVerbose      = false;
+
+
 //--- Confluence Module Inputs (M15 Baseline) ---
 input group "Confluence Modules"
 input ENUM_BC_ALIGN_MODE BC_AlignMode   = BC_REQUIRED;
@@ -574,6 +590,20 @@ int      g_rg_day_sl_hits       = 0;
 int      g_rg_consec_losses     = 0;
 bool     g_rg_block_active      = false;
 datetime g_rg_block_until       = 0;
+
+// --- T034: Harmonizer State ---
+class HM_Task : public CObject {
+public:
+  string   symbol;
+  long     pos_ticket;
+  double   sl_target;
+  double   tp_target;
+  int      retries_left;
+  datetime next_try_time;
+  HM_Task(): pos_ticket(0), sl_target(0), tp_target(0), retries_left(0), next_try_time(0) {}
+};
+CArrayObj g_hm_tasks;
+datetime  g_hm_last_tick_ts = 0;
 
 
 // --- T012: Summary Counters ---
@@ -1191,8 +1221,9 @@ double CRC_MapConfToRisk(const int conf)
 //+------------------------------------------------------------------+
 //| Calculate Lot Size                                               |
 //+------------------------------------------------------------------+
-double CalculateLotSize(const int confidence, const double sl_pts)
+double CalculateLotSize(const int confidence, const double sl_distance_price)
 {
+  const double sl_pts = sl_distance_price / point;
   const double risk_pct = CRC_MapConfToRisk(confidence);
   return LotsFromRiskAndSL(risk_pct, sl_pts);
 }
@@ -1447,7 +1478,7 @@ bool SLTA_AdjustAndRescale(const int direction,
   }
 
   if((InpSLTA_Mode == SLTA_ADJUST_TP_KEEP_RR || InpSLTA_Mode == SLTA_SCALE_BOTH) && InpSLTA_MinRR > 0.0 && tp_pts1 > 0.0){
-    double rr_eff = tp_pts1 / sl_pts1;
+    double rr_eff = (sl_pts1 > 0) ? tp_pts1 / sl_pts1 : 0;
     if(rr_eff + 1e-9 < InpSLTA_MinRR){
       if(InpSLTA_LogVerbose) PrintFormat("[SLTA] RR %.2f below MinRR %.2f after adjust — cancel.", rr_eff, InpSLTA_MinRR);
       return !InpSLTA_StrictCancel;
@@ -1464,6 +1495,152 @@ bool SLTA_AdjustAndRescale(const int direction,
   return true;
 }
 
+//+------------------------------------------------------------------+
+//| >>> T034: Post-Fill Harmonizer Helpers <<<                       |
+//+------------------------------------------------------------------+
+bool HM_InsideFreezeBand(const string sym, const int direction, const double target_sl, const double target_tp)
+{
+  if(!InpHM_RespectFreeze) return false;
+  int freeze_pts = (int)SymbolInfoInteger(sym, SYMBOL_TRADE_FREEZE_LEVEL);
+  if(freeze_pts <= 0) return false;
+
+  double bid = 0, ask = 0;
+  SymbolInfoDouble(sym, SYMBOL_BID, bid);
+  SymbolInfoDouble(sym, SYMBOL_ASK, ask);
+
+  double freeze_px = freeze_pts * _Point;
+
+  if(direction > 0){ // BUY
+    if(target_sl>0 && (ask - target_sl) < freeze_px) return true;
+    if(target_tp>0 && (target_tp - bid) < freeze_px) return true;
+  }else{ // SELL
+    if(target_sl>0 && (target_sl - bid) < freeze_px) return true;
+    if(target_tp>0 && (ask - target_tp) < freeze_px) return true;
+  }
+  return false;
+}
+
+bool HM_SanitizeTargets(const string sym, const int direction, double &sl_io, double &tp_io)
+{
+  int minStopsPts = BrokerMinStopsPts();
+  double minStopsPx = minStopsPts * _Point;
+  double bid=0, ask=0; SymbolInfoDouble(sym, SYMBOL_BID, bid); SymbolInfoDouble(sym, SYMBOL_ASK, ask);
+
+  // Ensure on correct side and outside min-stops from current quote
+  if(direction > 0){ // BUY
+    if(sl_io > 0) sl_io = MathMin(sl_io, ask - minStopsPx);
+    if(tp_io > 0) tp_io = MathMax(tp_io, bid + minStopsPx);
+  }else{ // SELL
+    if(sl_io > 0) sl_io = MathMax(sl_io, bid + minStopsPx);
+    if(tp_io > 0) tp_io = MathMin(tp_io, ask - minStopsPx);
+  }
+
+  if(sl_io > 0) sl_io = NormalizePriceByTick(sl_io);
+  if(tp_io > 0) tp_io = NormalizePriceByTick(tp_io);
+
+  // Sanity: SL/TP must still be on the correct side
+  if(direction > 0){
+    if(sl_io>0 && sl_io >= ask) return false;
+    if(tp_io>0 && tp_io <= bid) return false;
+  }else{
+    if(sl_io>0 && sl_io <= bid) return false;
+    if(tp_io>0 && tp_io >= ask) return false;
+  }
+  return true;
+}
+
+bool HM_ShouldModify(const double cur_sl, const double cur_tp,
+                     const double tgt_sl, const double tgt_tp,
+                     const int minChangePts)
+{
+  double dsl = ( (cur_sl<=0 || tgt_sl<=0) ? (cur_sl==tgt_sl ? 0.0 : DBL_MAX)
+                                           : MathAbs(cur_sl - tgt_sl)/_Point );
+  double dtp = ( (cur_tp<=0 || tgt_tp<=0) ? (cur_tp==tgt_tp ? 0.0 : DBL_MAX)
+                                           : MathAbs(cur_tp - tgt_tp)/_Point );
+  if(dsl==DBL_MAX && dtp==DBL_MAX) return true; // add/remove stops
+  return (dsl >= minChangePts) || (dtp >= minChangePts);
+}
+
+void HM_Enqueue(const string sym, const long pos_ticket, const double sl_target, const double tp_target)
+{
+  if(!InpHM_Enable || InpHM_Mode==HM_OFF) return;
+  HM_Task *t = new HM_Task;
+  t.symbol = sym;
+  t.pos_ticket = pos_ticket;
+  t.sl_target = (sl_target>0 ? NormalizePriceByTick(sl_target) : 0.0);
+  t.tp_target = (tp_target>0 ? NormalizePriceByTick(tp_target) : 0.0);
+  t.retries_left = (InpHM_Mode==HM_ONESHOT_IMMEDIATE ? 0 : MathMax(0, InpHM_MaxRetries));
+  int delay = (InpHM_Mode==HM_ONESHOT_IMMEDIATE ? 0 : MathMax(0, InpHM_DelayMs));
+  t.next_try_time = TimeCurrent() + (delay/1000); // coarse to seconds for server time
+  g_hm_tasks.Add(t);
+}
+
+void HM_OnTick()
+{
+  if(!InpHM_Enable || InpHM_Mode==HM_OFF) return;
+  if(g_hm_tasks.Total()==0) return;
+
+  int processed = 0;
+  for(int i = g_hm_tasks.Total()-1; i >= 0 && processed < 3; --i)
+  {
+    HM_Task *t = (HM_Task*)g_hm_tasks.At(i);
+    if(!t) { g_hm_tasks.Delete(i); continue; }
+    if(TimeCurrent() < t.next_try_time) continue;
+
+    bool have = PositionSelect(t.symbol);
+    if(!have && t.pos_ticket>0) have = PositionSelectByTicket(t.pos_ticket);
+    if(!have){ g_hm_tasks.Delete(i); delete t; continue; }
+
+    int ptype = (int)PositionGetInteger(POSITION_TYPE);
+    int direction = (ptype==POSITION_TYPE_BUY ? +1 : -1);
+    double cur_sl = PositionGetDouble(POSITION_SL);
+    double cur_tp = PositionGetDouble(POSITION_TP);
+
+    if(!HM_ShouldModify(cur_sl, cur_tp, t.sl_target, t.tp_target, InpHM_MinChangePts)){
+      g_hm_tasks.Delete(i); delete t; continue;
+    }
+
+    if(HM_InsideFreezeBand(t.symbol, direction, t.sl_target, t.tp_target)){
+      t.next_try_time = TimeCurrent() + (MathMax(1, InpHM_BackoffMs)/1000);
+      continue;
+    }
+
+    double sl = t.sl_target, tp = t.tp_target;
+    if(!HM_SanitizeTargets(t.symbol, direction, sl, tp)){
+      if(t.retries_left > 0){
+        t.retries_left--;
+        t.next_try_time = TimeCurrent() + (MathMax(1, InpHM_BackoffMs)/1000);
+        continue;
+      }else{
+        if(InpHM_LogVerbose) Print("[HM] sanitize failed; giving up.");
+        g_hm_tasks.Delete(i); delete t; continue;
+      }
+    }
+
+    CTrade tr;
+    tr.SetExpertMagicNumber(MagicNumber);
+    bool ok = tr.PositionModify(_Symbol, sl, tp);
+    uint rc = tr.ResultRetcode();
+    if(ok && (rc==TRADE_RETCODE_DONE)){
+      if(InpHM_LogVerbose) Print("[HM] modify done.");
+      g_hm_tasks.Delete(i); delete t; processed++; continue;
+    }
+
+    if(InpHM_LogVerbose) PrintFormat("[HM] modify fail ret=%u, retries_left=%d", rc, t.retries_left);
+
+    bool retryable = OSR_IsRetryable(rc)
+                     || (rc==TRADE_RETCODE_INVALID || rc==TRADE_RETCODE_INVALID_STOPS);
+
+    if(t.retries_left > 0 && retryable){
+      t.retries_left--;
+      t.next_try_time = TimeCurrent() + (MathMax(1, InpHM_BackoffMs)/1000);
+      processed++;
+      continue;
+    }else{
+      g_hm_tasks.Delete(i); delete t; processed++; continue;
+    }
+  }
+}
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                            |
@@ -1507,6 +1684,9 @@ g_as_forming_bar_time = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 0);
 // --- T030: Init Risk Guard state ---
 RG_ResetDay();
 g_rg_consec_losses = 0; // Full reset on init
+
+// --- T034: Init Harmonizer state ---
+g_hm_tasks.Clear();
 
 // --- TICKET #2: Create the single, centralized SignalBrain handle ---
 sb_handle = iCustom(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, AAI_Ind("AAI_Indicator_SignalBrain"),
@@ -1591,6 +1771,7 @@ void OnTesterDeinit() { PrintSummary(); }
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   g_hm_tasks.Clear();
    
    // --- AAI END-OF-TEST SUMMARY (Journal) ---
    double PF = (AAI_gross_loss > 0.0 ? (AAI_gross_profit / AAI_gross_loss) : (AAI_gross_profit > 0.0 ? DBL_MAX : 0.0));
@@ -1929,7 +2110,8 @@ void AS_OnTickSample()
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   AS_OnTickSample(); // T028: Sample spread on every tick
+   AS_OnTickSample();   // T028 sampler
+   HM_OnTick();         // T034 harmonizer worker
    g_tickCount++;
    
    if(PositionSelect(_Symbol))
@@ -2774,8 +2956,10 @@ bool TryOpenPosition(int signal, double conf_eff, int reason_code, double ze_str
      PrintFormat("[AAI_SENDFAIL] retcode=%u lots=%.2f dir=%d", tRes.retcode, lots_to_trade, signal);
      return false;
    }
-
+   
    // --- Post-open bookkeeping ---
+   if(tRes.deal > 0) HM_Enqueue(_Symbol, (long)PositionGetInteger(POSITION_TICKET), slPrice, tpPrice);
+
    g_entries++;
    PrintFormat("%s Signal:%s → Executed %.2f lots @%.5f | SL:%.5f TP:%.5f",
                EVT_ENTRY, (signal > 0 ? "BUY":"SELL"), tRes.volume, tRes.price, slPrice, tpPrice);
