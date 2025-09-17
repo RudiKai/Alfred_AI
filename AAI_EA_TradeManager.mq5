@@ -48,14 +48,14 @@ int    AAI_dur_count   = 0;
 // ==================== /AAI METRICS ======================
 //+------------------------------------------------------------------+
 //| AAI_EA_Trade_Manager.mq5                                         |
-//|                    v5.2.1 - Compile Fixes                        |
+//|                    v5.3 - Confidence-to-Risk Curve               |
 //|                                                                  |
 //| (Consumes all data from the refactored AAI_Indicator_SignalBrain)|
 //|                                                                  |
 //| Copyright 2025, AlfredAI Project                                 |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "5.21"
+#property version   "5.3"
 #property description "Manages trades based on signals from the central SignalBrain indicator."
 #include <Trade\Trade.mqh>
 #include <Arrays\ArrayLong.mqh>
@@ -224,6 +224,9 @@ enum ENUM_ENTRY_MODE { FirstBarOrEdge, EdgeOnly };
 enum ENUM_OVEREXT_MODE { HardBlock, WaitForBand };
 enum ENUM_ZE_GATE_MODE { ZE_OFF=0, ZE_PREFERRED=1, ZE_REQUIRED=2 };
 enum ENUM_BC_ALIGN_MODE { BC_OFF = 0, BC_PREFERRED = 1, BC_REQUIRED = 2 };
+// T032: Confidence-to-Risk Curve Mode
+enum ENUM_CRC_Mode { CRC_OFF=0, CRC_LINEAR=1, CRC_QUADRATIC=2, CRC_LOGISTIC=3, CRC_PIECEWISE=4 };
+
 //--- EA Inputs
 input ENUM_EXECUTION_MODE ExecutionMode = AutoExecute;
 input ENUM_APPROVAL_MODE  ApprovalMode  = None;
@@ -276,13 +279,33 @@ input int    SB_SMC_BOS_Lookback= 50;
 
 
 //--- Risk Management Inputs ---
-input group "Risk Management (M15 Baseline)"
-input double   RiskPct           = 0.25;
+input group "Risk Management"
 input double   MinLotSize           = 0.01;
 input double   MaxLotSize           = 10.0;
 input int      SL_Buffer_Points  = 10;
+
+// --- Confidence → Risk Curve (T032) ---
+input group "Confidence → Risk Curve"
+input bool         InpCRC_Enable          = true;
+input ENUM_CRC_Mode InpCRC_Mode           = CRC_LINEAR;
+input double       InpCRC_MinRiskPct      = 0.50;
+input double       InpCRC_MaxRiskPct      = 1.00;
+input double       InpCRC_MinLots         = 0.00;
+input double       InpCRC_MaxLots         = 0.00;
+input double       InpCRC_MaxRiskMoney    = 0.00;
+input int          InpCRC_MinConfidence   = 50;
+input double       InpCRC_QuadAlpha       = 1.00;
+input double       InpCRC_LogisticMid     = 70.0;
+input double       InpCRC_LogisticSlope   = 0.15;
+input int          InpCRC_PW_C1           = 60;
+input double       InpCRC_PW_R1           = 0.70;
+input int          InpCRC_PW_C2           = 75;
+input double       InpCRC_PW_R2           = 0.85;
+input int          InpCRC_PW_C3           = 90;
+input double       InpCRC_PW_R3           = 0.95;
+
 //--- Trade Management Inputs ---
-input group "Trade Management (M15 Baseline)"
+input group "Trade Management"
 input bool     PerBarDebounce       = true;
 input uint     DuplicateGuardMs     = 300;
 input int      CooldownAfterSLBars  = 2;
@@ -1040,35 +1063,122 @@ ulong StringToULongHash(string s)
 }
 
 //+------------------------------------------------------------------+
+//| >>> T032: Confidence-to-Risk Curve Helpers <<<                   |
+//+------------------------------------------------------------------+
+double LotsFromRiskAndSL(const double risk_pct, const double sl_pts)
+{
+  // Guard
+  if(sl_pts <= 0.0 || risk_pct <= 0.0) return 0.0;
+
+  const double bal       = AccountInfoDouble(ACCOUNT_BALANCE);
+  const double risk_money= bal * (risk_pct/100.0);
+
+  const double tick_val  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+  const double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+
+  double point_value = 0.0;
+  if(tick_val>0.0 && tick_size>0.0)
+    point_value = tick_val * (point / tick_size);
+  else
+    point_value = tick_val; // fallback; many FX have tick_size==_Point
+
+  if(point_value <= 0.0) return 0.0;
+
+  const double risk_per_lot = sl_pts * point_value;
+  if(risk_per_lot <= 0.0) return 0.0;
+
+  double lots = risk_money / risk_per_lot;
+
+  // Apply lot clamps if set
+  if(InpCRC_MinLots > 0.0) lots = MathMax(lots, InpCRC_MinLots);
+  if(InpCRC_MaxLots > 0.0) lots = MathMin(lots, InpCRC_MaxLots);
+
+  return NormalizeLots(lots);
+}
+
+double CRC_MapConfToRisk(const int conf)
+{
+  const double c = (double)MathMax(0, MathMin(100, conf));
+  const double rmin = MathMax(0.0, InpCRC_MinRiskPct);
+  const double rmax = MathMax(rmin, InpCRC_MaxRiskPct);
+
+  if(!InpCRC_Enable || InpCRC_Mode==CRC_OFF)
+    return rmax;
+
+  const double t = c/100.0;
+  double r = rmin;
+
+  switch(InpCRC_Mode)
+  {
+    case CRC_LINEAR:
+    {
+      const double c0 = (double)MathMax(0, MathMin(100, InpCRC_MinConfidence));
+      if(c <= c0) r = rmin;
+      else{
+        const double frac = (c - c0) / (100.0 - c0);
+        r = rmin + (rmax - rmin) * MathMax(0.0, MathMin(1.0, frac));
+      }
+      break;
+    }
+    case CRC_QUADRATIC:
+    {
+      const double a = MathMax(0.2, MathMin(2.0, InpCRC_QuadAlpha));
+      r = rmin + (rmax - rmin) * MathPow(t, a);
+      break;
+    }
+    case CRC_LOGISTIC:
+    {
+      const double k   = MathMax(0.01, InpCRC_LogisticSlope);
+      const double mid = MathMax(0.0, MathMin(100.0, InpCRC_LogisticMid));
+      const double x   = c - mid;
+      const double s   = 1.0 / (1.0 + MathExp(-k * x));
+      r = rmin + (rmax - rmin) * s;
+      break;
+    }
+    case CRC_PIECEWISE:
+    {
+      int    C1 = MathMax(0,   MathMin(100, InpCRC_PW_C1));
+      int    C2 = MathMax(C1,  MathMin(100, InpCRC_PW_C2));
+      int    C3 = MathMax(C2,  MathMin(100, InpCRC_PW_C3));
+      double R1 = MathMax(rmin, MathMin(rmax, InpCRC_PW_R1));
+      double R2 = MathMax(rmin, MathMin(rmax, InpCRC_PW_R2));
+      double R3 = MathMax(rmin, MathMin(rmax, InpCRC_PW_R3));
+
+      if(c <= C1){
+        double frac = (C1>0 ? c/(double)C1 : 1.0);
+        r = rmin + (R1 - rmin) * frac;
+      }else if(c <= C2){
+        double frac = (C2>C1 ? (c - C1)/(double)(C2 - C1) : 1.0);
+        r = R1 + (R2 - R1) * frac;
+      }else if(c <= C3){
+        double frac = (C3>C2 ? (c - C2)/(double)(C3 - C2) : 1.0);
+        r = R2 + (R3 - R2) * frac;
+      }else{
+        double frac = (100>C3 ? (c - C3)/(double)(100 - C3) : 1.0);
+        r = R3 + (rmax - R3) * frac;
+      }
+      break;
+    }
+  }
+
+  if(InpCRC_MaxRiskMoney > 0.0)
+  {
+    const double bal = AccountInfoDouble(ACCOUNT_BALANCE);
+    const double risk_money = bal * (r/100.0);
+    if(risk_money > InpCRC_MaxRiskMoney)
+      r = (InpCRC_MaxRiskMoney / MathMax(1e-9, bal)) * 100.0;
+  }
+  return r;
+}
+
+//+------------------------------------------------------------------+
 //| Calculate Lot Size                                               |
 //+------------------------------------------------------------------+
-double CalculateLotSize(int confidence, double sl_distance_price)
+double CalculateLotSize(const int confidence, const double sl_distance_price)
 {
-   if(sl_distance_price <= 0) return 0.0;
-   double account_balance = AccountInfoDouble(ACCOUNT_BALANCE);
-   double risk_amount = account_balance * (RiskPct / 100.0);
-   double tick_size = SymbolInfoDouble(symbolName, SYMBOL_TRADE_TICK_SIZE);
-   double tick_value_loss = SymbolInfoDouble(symbolName, SYMBOL_TRADE_TICK_VALUE_LOSS);
-   if(tick_size <= 0) return 0.0;
-   double loss_per_lot = (sl_distance_price / tick_size) * tick_value_loss;
-   if(loss_per_lot <= 0) return 0.0;
-   double base_lot_size = risk_amount / loss_per_lot;
-   // Confidence scaling (0-100 scale)
-   double scale_min = 0.5;
-   double scale_max = 1.0;
-   double conf_range = 100.0 - MinConfidence;
-   double conf_step = confidence - MinConfidence;
-   double scaling_factor = scale_min;
-   if(conf_range > 0)
-     {
-      scaling_factor = scale_min + ((scale_max - scale_min) * (conf_step / conf_range));
-     }
-   scaling_factor = fmax(scale_min, fmin(scale_max, scaling_factor));
-   double final_lot_size = base_lot_size * scaling_factor;
-   double lot_step = SymbolInfoDouble(symbolName, SYMBOL_VOLUME_STEP);
-   final_lot_size = round(final_lot_size / lot_step) * lot_step;
-   final_lot_size = fmax(MinLotSize, fmin(MaxLotSize, final_lot_size));
-   return final_lot_size;
+  const double sl_pts = sl_distance_price / point;
+  const double risk_pct = CRC_MapConfToRisk(confidence);
+  return LotsFromRiskAndSL(risk_pct, sl_pts);
 }
 
 //+------------------------------------------------------------------+
@@ -1111,7 +1221,9 @@ double NormalizeLots(double lots)
   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
   double minv = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
   double maxv = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-  lots = MathMax(minv, MathMin(maxv, MathFloor(lots/step + 0.5) * step));
+  if(step > 0)
+    lots = MathRound(lots/step) * step;
+  lots = MathMax(minv, MathMin(maxv, lots));
   return lots;
 }
 
@@ -1166,9 +1278,8 @@ bool OSR_IsRetryable(const uint retcode)
     case TRADE_RETCODE_REQUOTE:
     case TRADE_RETCODE_PRICE_OFF:
     case TRADE_RETCODE_REJECT:
-    // Non-standard but common retcodes for transient issues
-    case 10025: // TRADE_RETCODE_NO_CONNECTION
-    case 10026: // TRADE_RETCODE_TRADE_CONTEXT_BUSY
+    case 10025: // TRADE_RETCODE_NO_CONNECTION:
+    case 10026: // TRADE_RETCODE_TRADE_CONTEXT_BUSY:
       return true;
   }
   return false;
