@@ -48,14 +48,14 @@ int    AAI_dur_count   = 0;
 // ==================== /AAI METRICS ======================
 //+------------------------------------------------------------------+
 //| AAI_EA_Trade_Manager.mq5                                         |
-//|                    v4.9 - Adaptive Spread Gate                   |
+//|                    v5.0 - Inter-Market Gate                      |
 //|                                                                  |
 //| (Consumes all data from the refactored AAI_Indicator_SignalBrain)|
 //|                                                                  |
 //| Copyright 2025, AlfredAI Project                                 |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "4.9"
+#property version   "5.0"
 #property description "Manages trades based on signals from the central SignalBrain indicator."
 #include <Trade\Trade.mqh>
 #include <Arrays\ArrayLong.mqh>
@@ -401,6 +401,30 @@ input int          InpAS_SafetyPts          = 2;
 input bool         InpAS_ClampToFixedMax    = true;
 input int          InpAS_PrefPenalty        = 2;
 
+// --- Inter-Market Confirmation (T029) ---
+input group "Inter-Market Confirmation"
+enum ENUM_IMC_Mode   { IMC_OFF=0, IMC_REQUIRED=1, IMC_PREFERRED=2 };
+enum ENUM_IMC_Rel    { IMC_ALIGN=1, IMC_CONTRA=-1 };
+enum ENUM_IMC_Method { IMC_ROC=0 };
+input bool           InpIMC_Enable            = true;
+input ENUM_IMC_Mode  InpIMC_Mode              = IMC_REQUIRED;
+input string         InpIMC1_Symbol           = "";
+input ENUM_TIMEFRAMES InpIMC1_Timeframe       = PERIOD_H1;
+input ENUM_IMC_Rel   InpIMC1_Relation         = IMC_CONTRA;
+input ENUM_IMC_Method InpIMC1_Method          = IMC_ROC;
+input int            InpIMC1_LookbackBars     = 10;
+input double         InpIMC1_MinAbsRocBps     = 0.0;
+input string         InpIMC2_Symbol           = "";
+input ENUM_TIMEFRAMES InpIMC2_Timeframe       = PERIOD_H1;
+input ENUM_IMC_Rel   InpIMC2_Relation         = IMC_ALIGN;
+input ENUM_IMC_Method InpIMC2_Method          = IMC_ROC;
+input int            InpIMC2_LookbackBars     = 10;
+input double         InpIMC2_MinAbsRocBps     = 0.0;
+input double         InpIMC1_Weight           = 1.0;
+input double         InpIMC2_Weight           = 1.0;
+input double         InpIMC_MinSupport        = 0.50;
+input int            InpIMC_PrefPenalty       = 4;
+
 //--- Confluence Module Inputs (M15 Baseline) ---
 input group "Confluence Modules"
 input ENUM_BC_ALIGN_MODE BC_AlignMode   = BC_REQUIRED;
@@ -454,10 +478,13 @@ static ulong    g_last_send_sig_hash = 0;
 static ulong g_last_send_ms = 0;
 static datetime g_cool_until_buy = 0, g_cool_until_sell = 0;
 
-// --- T026/T027: Per-bar flags for decision journaling ---
-static int  g_vr_flag_for_bar   = 0;
-static int  g_news_flag_for_bar = 0;
-static bool g_sp_hit_for_bar    = false;
+// --- T026/T027/T029: Per-bar flags for decision journaling ---
+static int    g_vr_flag_for_bar   = 0;
+static int    g_news_flag_for_bar = 0;
+static bool   g_sp_hit_for_bar    = false;
+static bool   g_imc_flag_for_bar  = false;
+static double g_imc_support       = 0.0;
+
 
 // --- T028: Adaptive Spread State ---
 int      g_as_tick_ctr            = 0;
@@ -476,6 +503,7 @@ static long g_wins         = 0;
 static long g_losses       = 0;
 static long g_blk_ze       = 0;
 static long g_blk_bc       = 0;
+static long g_blk_imc      = 0; // T029
 static long g_blk_over     = 0;
 static long g_blk_spread   = 0;
 static long g_blk_aspread  = 0; // T028
@@ -488,6 +516,7 @@ static bool g_summary_printed = false;
 datetime g_stamp_conf  = 0;
 datetime g_stamp_ze    = 0;
 datetime g_stamp_bc    = 0;
+datetime g_stamp_imc   = 0; // T029
 datetime g_stamp_over  = 0;
 datetime g_stamp_sess  = 0;
 datetime g_stamp_spd   = 0;
@@ -517,7 +546,7 @@ datetime g_stamp_hyb = 0;     // once-per-bar stamp
 void PrintSummary()
 {
     if(g_summary_printed) return;
-    PrintFormat("AAI_SUMMARY|entries=%d|wins=%d|losses=%d|ze_blk=%d|bc_blk=%d|smc_blk=%d|overext_blk=%d|spread_blk=%d|aspread_blk=%d|vr_blk=%d|news_blk=%d|sp_blk=%d",
+    PrintFormat("AAI_SUMMARY|entries=%d|wins=%d|losses=%d|ze_blk=%d|bc_blk=%d|smc_blk=%d|overext_blk=%d|spread_blk=%d|aspread_blk=%d|vr_blk=%d|news_blk=%d|sp_blk=%d|imc_blk=%d",
                 g_entries,
                 g_wins,
                 g_losses,
@@ -529,7 +558,8 @@ void PrintSummary()
                 g_blk_aspread,
                 g_blk_vr,
                 g_blk_news,
-                g_blk_sp);
+                g_blk_sp,
+                g_blk_imc);
     g_summary_printed = true;
 }
 
@@ -761,6 +791,8 @@ void DJ_Write(const int direction,
               const int as_flag,
               const double as_cap_pts,
               const int as_hist_n,
+              const int imc_flag,
+              const double imc_support,
               const double spread_pts,
               const double lots,
               const double sl_pts,
@@ -777,7 +809,7 @@ void DJ_Write(const int direction,
   // Write header if file is empty or we’re not appending
   if(FileSize(h) == 0 || !InpDJ_Append){
     FileSeek(h, 0, SEEK_SET);
-    string header = "time,symbol,tf,dir,conf,sb_reason,ze_strength,bc_bias,smc_sig,smc_conf,vr_flag,news_flag,sp_flag,as_flag,as_cap_pts,as_histN,spread_pts,lots,sl_pts,tp_pts,rr,entry_mode\r\n";
+    string header = "time,symbol,tf,dir,conf,sb_reason,ze_strength,bc_bias,smc_sig,smc_conf,vr_flag,news_flag,sp_flag,as_flag,as_cap_pts,as_histN,imc_flag,imc_support,spread_pts,lots,sl_pts,tp_pts,rr,entry_mode\r\n";
     FileWriteString(h, header);
   }
 
@@ -787,7 +819,7 @@ void DJ_Write(const int direction,
   datetime t = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1); // closed bar time
   string tf  = TfLabel((ENUM_TIMEFRAMES)SignalTimeframe);
 
-  string row = StringFormat("%s,%s,%s,%d,%.0f,%d,%.1f,%d,%d,%.1f,%d,%d,%d,%d,%.0f,%d,%.0f,%.2f,%.0f,%.0f,%.2f,%s\r\n",
+  string row = StringFormat("%s,%s,%s,%d,%.0f,%d,%.1f,%d,%d,%.1f,%d,%d,%d,%d,%.0f,%d,%d,%.2f,%.0f,%.2f,%.0f,%.0f,%.2f,%s\r\n",
     TimeToString(t, TIME_DATE|TIME_SECONDS),
     _Symbol,
     tf,
@@ -804,6 +836,8 @@ void DJ_Write(const int direction,
     as_flag,
     as_cap_pts,
     as_hist_n,
+    imc_flag,
+    imc_support,
     spread_pts,
     lots,
     sl_pts,
@@ -1002,6 +1036,7 @@ int OnInit()
    g_blk_news = 0;
    g_blk_vr = 0;
    g_blk_sp = 0;
+   g_blk_imc = 0;
    g_summary_printed = false;
    g_sb.valid = false; // Initialize cache as invalid
 
@@ -1502,6 +1537,64 @@ double AS_MedianOfHistory()
   return (N%2!=0 ? tmp[N/2] : 0.5*(tmp[N/2-1] + tmp[N/2]));
 }
 
+//+------------------------------------------------------------------+
+//| >>> T029 Inter-Market Confirmation Helpers <<<                   |
+//+------------------------------------------------------------------+
+bool IMC_RocBps(const string sym, const ENUM_TIMEFRAMES tf, const int lookback, double &roc_bps_out)
+{
+  roc_bps_out = 0.0;
+  if(sym=="" || lookback < 1) return false;
+  if(!SymbolSelect(sym, true)) return false;
+
+  double c_new[1], c_old[1];
+  if(CopyClose(sym, tf, 1, 1, c_new) != 1) return false;
+  if(CopyClose(sym, tf, 1+lookback, 1, c_old) != 1) return false;
+  if(c_old[0] == 0.0) return false;
+
+  double roc = (c_new[0] - c_old[0]) / c_old[0];
+  roc_bps_out = roc * 10000.0;
+  return true;
+}
+
+double IMC_PerConfSupport_ROC(const int our_direction, const string sym, ENUM_TIMEFRAMES tf,
+                              ENUM_IMC_Rel rel, int lookback, double minAbsBps)
+{
+  double roc_bps;
+  if(!IMC_RocBps(sym, tf, lookback, roc_bps)) return 0.5; // neutral if unavailable
+
+  if(MathAbs(roc_bps) < MathMax(0.0, minAbsBps)) return 0.5;
+
+  int conf_dir = (roc_bps > 0.0 ? +1 : -1);
+  conf_dir = (rel==IMC_CONTRA ? -conf_dir : conf_dir);
+
+  if(conf_dir == our_direction) return 1.0;
+  return 0.0; // opposing
+}
+
+double IMC_WeightedSupport(const int our_direction)
+{
+  double wsum = 0.0, accum = 0.0;
+
+  if(InpIMC1_Symbol != "")
+  {
+    double s1 = IMC_PerConfSupport_ROC(our_direction, InpIMC1_Symbol, InpIMC1_Timeframe,
+                                       InpIMC1_Relation, InpIMC1_LookbackBars, InpIMC1_MinAbsRocBps);
+    accum += InpIMC1_Weight * s1;
+    wsum  += MathMax(0.0, InpIMC1_Weight);
+  }
+
+  if(InpIMC2_Symbol != "")
+  {
+    double s2 = IMC_PerConfSupport_ROC(our_direction, InpIMC2_Symbol, InpIMC2_Timeframe,
+                                       InpIMC2_Relation, InpIMC2_LookbackBars, InpIMC2_MinAbsRocBps);
+    accum += InpIMC2_Weight * s2;
+    wsum  += MathMax(0.0, InpIMC2_Weight);
+  }
+
+  if(wsum <= 0.0) return 1.0; // no active confirmers → fully permissive
+  return accum / wsum;
+}
+
 
 //+------------------------------------------------------------------+
 //| >>> T025 GATE REFACTOR: Gate Functions <<<                       |
@@ -1841,7 +1934,35 @@ bool GateBC(const int direction, const int bc_bias, string &reason_id)
     return true;
 }
 
-// --- Gate 12: Confidence ---
+// --- Gate 12: Inter-Market Confirmation (T029) ---
+bool GateInterMarket(const int direction, double &conf_io, string &reason_id)
+{
+  g_imc_flag_for_bar = false;
+  g_imc_support = 1.0;
+
+  if(!InpIMC_Enable || InpIMC_Mode==IMC_OFF) return true;
+
+  // Compute weighted support [0..1] from configured confirmers
+  g_imc_support = IMC_WeightedSupport(direction);
+
+  if(g_imc_support < MathMin(1.0, MathMax(0.0, InpIMC_MinSupport)))
+  {
+    g_imc_flag_for_bar = true;
+    if(InpIMC_Mode == IMC_REQUIRED){
+      reason_id = "imc";     // inter-market confirmation
+      if(g_stamp_imc != g_sb.closed_bar_time) { g_blk_imc++; g_stamp_imc = g_sb.closed_bar_time; }
+      return false;          // BLOCK
+    } else {
+      conf_io = MathMax(0.0, conf_io - (double)InpIMC_PrefPenalty);
+      return true;           // allow with penalty
+    }
+  }
+
+  return true; // passed
+}
+
+
+// --- Gate 13: Confidence ---
 bool GateConfidence(const double conf_eff, string &reason_id)
 {
     if(conf_eff < MinConfidence)
@@ -1853,7 +1974,7 @@ bool GateConfidence(const double conf_eff, string &reason_id)
     return true;
 }
 
-// --- Gate 13: Cooldown ---
+// --- Gate 14: Cooldown ---
 bool GateCooldown(const int direction, string &reason_id)
 {
     int secs = PeriodSeconds((ENUM_TIMEFRAMES)SignalTimeframe);
@@ -1869,7 +1990,7 @@ bool GateCooldown(const int direction, string &reason_id)
     return true;
 }
 
-// --- Gate 14: Debounce ---
+// --- Gate 15: Debounce ---
 bool GateDebounce(const int direction, string &reason_id)
 {
     if(PerBarDebounce)
@@ -1887,7 +2008,7 @@ bool GateDebounce(const int direction, string &reason_id)
     return true;
 }
 
-// --- Gate 15: Position ---
+// --- Gate 16: Position ---
 bool GatePosition(string &reason_id)
 {
     if(PositionSelect(_Symbol))
@@ -1898,7 +2019,7 @@ bool GatePosition(string &reason_id)
     return true;
 }
 
-// --- Gate 16: Trigger ---
+// --- Gate 17: Trigger ---
 bool GateTrigger(const int direction, const int prev_sb_sig, string &reason_id)
 {
     bool is_edge = (direction != prev_sb_sig);
@@ -1938,6 +2059,7 @@ void EvaluateClosedBar()
     g_news_flag_for_bar = 0;
     g_sp_hit_for_bar = false;
     g_as_exceeded_for_bar = false;
+    g_imc_flag_for_bar = false;
     
     // --- Signal Gate: If no signal, we're done for this bar. ---
     if(direction == 0)
@@ -1959,6 +2081,7 @@ void EvaluateClosedBar()
     if(!GateZE(direction, ze_strength, reason_id)) { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
     if(!GateSMC(direction, smc_sig, smc_conf, reason_id)) { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
     if(!GateBC(direction, bc_bias, reason_id))  { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
+    if(!GateInterMarket(direction, conf_eff, reason_id)) { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
     if(!GateConfidence(conf_eff, reason_id))    { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
     if(!GateCooldown(direction, reason_id))     { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
     if(!GateDebounce(direction, reason_id))     { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
@@ -2163,6 +2286,7 @@ bool TryOpenPosition(int signal, double conf_eff, int reason_code, double ze_str
    DJ_Write(signal, conf_eff, reason_code, ze_strength, bc_bias, smc_sig, smc_conf, 
             g_vr_flag_for_bar, g_news_flag_for_bar, g_sp_hit_for_bar ? 1 : 0, 
             g_as_exceeded_for_bar ? 1 : 0, g_as_cap_pts_last, g_as_hist_count,
+            g_imc_flag_for_bar ? 1 : 0, g_imc_support,
             (double)CurrentSpreadPoints(), 
             lots_to_trade, sl_pts, tp_pts, rr_calc, entry_mode);
 
