@@ -48,14 +48,14 @@ int    AAI_dur_count   = 0;
 // ==================== /AAI METRICS ======================
 //+------------------------------------------------------------------+
 //| AAI_EA_Trade_Manager.mq5                                         |
-//|                    v5.3 - Confidence-to-Risk Curve               |
+//|                    v5.4 - SL/TP Safety & Auto-Adjust             |
 //|                                                                  |
 //| (Consumes all data from the refactored AAI_Indicator_SignalBrain)|
 //|                                                                  |
 //| Copyright 2025, AlfredAI Project                                 |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "5.3"
+#property version   "5.4"
 #property description "Manages trades based on signals from the central SignalBrain indicator."
 #include <Trade\Trade.mqh>
 #include <Arrays\ArrayLong.mqh>
@@ -226,6 +226,13 @@ enum ENUM_ZE_GATE_MODE { ZE_OFF=0, ZE_PREFERRED=1, ZE_REQUIRED=2 };
 enum ENUM_BC_ALIGN_MODE { BC_OFF = 0, BC_PREFERRED = 1, BC_REQUIRED = 2 };
 // T032: Confidence-to-Risk Curve Mode
 enum ENUM_CRC_Mode { CRC_OFF=0, CRC_LINEAR=1, CRC_QUADRATIC=2, CRC_LOGISTIC=3, CRC_PIECEWISE=4 };
+// T033: SL/TP Auto-Adjust Mode
+enum ENUM_SLTA_Mode {
+  SLTA_OFF=0,
+  SLTA_ADJUST_TP_KEEP_RR=1,
+  SLTA_ADJUST_SL_ONLY=2,
+  SLTA_SCALE_BOTH=3
+};
 
 //--- EA Inputs
 input ENUM_EXECUTION_MODE ExecutionMode = AutoExecute;
@@ -280,8 +287,6 @@ input int    SB_SMC_BOS_Lookback= 50;
 
 //--- Risk Management Inputs ---
 input group "Risk Management"
-input double   MinLotSize           = 0.01;
-input double   MaxLotSize           = 10.0;
 input int      SL_Buffer_Points  = 10;
 
 // --- Confidence → Risk Curve (T032) ---
@@ -290,8 +295,8 @@ input bool         InpCRC_Enable          = true;
 input ENUM_CRC_Mode InpCRC_Mode           = CRC_LINEAR;
 input double       InpCRC_MinRiskPct      = 0.50;
 input double       InpCRC_MaxRiskPct      = 1.00;
-input double       InpCRC_MinLots         = 0.00;
-input double       InpCRC_MaxLots         = 0.00;
+input double       InpCRC_MinLots         = 0.01;
+input double       InpCRC_MaxLots         = 10.0;
 input double       InpCRC_MaxRiskMoney    = 0.00;
 input int          InpCRC_MinConfidence   = 50;
 input double       InpCRC_QuadAlpha       = 1.00;
@@ -476,6 +481,18 @@ enum ENUM_OSR_PriceMode { OSR_USE_LAST=0, OSR_USE_CURRENT=1 };
 input ENUM_OSR_PriceMode InpOSR_PriceMode = OSR_USE_CURRENT;
 input bool   InpOSR_AllowIOC          = true;
 input bool   InpOSR_LogVerbose        = false;
+
+// --- SL/TP Safety & MinStops Auto-Adjust (T033) ---
+input group "SL/TP Safety & MinStops Auto-Adjust"
+input bool         InpSLTA_Enable         = true;
+input ENUM_SLTA_Mode InpSLTA_Mode         = SLTA_ADJUST_TP_KEEP_RR;
+input double       InpSLTA_TargetRR       = 1.50;
+input double       InpSLTA_MinRR          = 1.20;
+input int          InpSLTA_ExtraBufferPts = 2;
+input double       InpSLTA_MaxWidenFrac   = 0.50;
+input int          InpSLTA_MaxTPPts       = 0;
+input bool         InpSLTA_StrictCancel   = true;
+input bool         InpSLTA_LogVerbose     = false;
 
 //--- Confluence Module Inputs (M15 Baseline) ---
 input group "Confluence Modules"
@@ -1174,9 +1191,8 @@ double CRC_MapConfToRisk(const int conf)
 //+------------------------------------------------------------------+
 //| Calculate Lot Size                                               |
 //+------------------------------------------------------------------+
-double CalculateLotSize(const int confidence, const double sl_distance_price)
+double CalculateLotSize(const int confidence, const double sl_pts)
 {
-  const double sl_pts = sl_distance_price / point;
   const double risk_pct = CRC_MapConfToRisk(confidence);
   return LotsFromRiskAndSL(risk_pct, sl_pts);
 }
@@ -1356,6 +1372,98 @@ bool OSR_SendMarket(const int direction,
 
   return false;
 }
+
+//+------------------------------------------------------------------+
+//| >>> T033: SL/TP Safety Helpers <<<                               |
+//+------------------------------------------------------------------+
+int BrokerMinStopsPts()
+{
+  int s = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+  return MathMax(0, s);
+}
+
+bool SLTA_AdjustAndRescale(const int direction,
+                           const double entry_price,
+                           double &sl_price_io,
+                           double &tp_price_io,
+                           double &lots_io,
+                           const int conf_for_sizing)
+{
+  if(!InpSLTA_Enable || InpSLTA_Mode==SLTA_OFF) return true;
+
+  const int minStopsPts = BrokerMinStopsPts() + MathMax(0, InpSLTA_ExtraBufferPts);
+  const double minStopsPx = minStopsPts * point;
+
+  double sl_pts0 = (sl_price_io>0.0 ? MathAbs(entry_price - sl_price_io)/point : 0.0);
+  double tp_pts0 = (tp_price_io>0.0 ? MathAbs(tp_price_io - entry_price)/point : 0.0);
+
+  if(sl_pts0 <= 0.0){
+    if(InpSLTA_LogVerbose) Print("[SLTA] No SL provided; cannot control risk — cancel.");
+    return !InpSLTA_StrictCancel;
+  }
+
+  if(direction > 0){ // BUY: SL below entry
+    double min_sl = entry_price - minStopsPx;
+    if(sl_price_io <= 0.0 || sl_price_io >= min_sl)
+      sl_price_io = min_sl;
+  }else{             // SELL: SL above entry
+    double min_sl = entry_price + minStopsPx;
+    if(sl_price_io <= 0.0 || sl_price_io <= min_sl)
+      sl_price_io = min_sl;
+  }
+  sl_price_io = NormalizePriceByTick(sl_price_io);
+  double sl_pts1 = MathAbs(entry_price - sl_price_io)/point;
+
+  if(sl_pts0 > 0.0 && InpSLTA_MaxWidenFrac > 0.0){
+    double allowed = sl_pts0 * (1.0 + InpSLTA_MaxWidenFrac);
+    if(sl_pts1 > allowed){
+      if(InpSLTA_LogVerbose) PrintFormat("[SLTA] SL widening %.0f→%.0f pts exceeds limit (max %.0f).",
+                                         sl_pts0, sl_pts1, allowed);
+      return !InpSLTA_StrictCancel;
+    }
+  }
+
+  double tp_pts1 = tp_pts0;
+  if(tp_pts0 > 0.0){
+    if(InpSLTA_Mode == SLTA_ADJUST_TP_KEEP_RR || InpSLTA_Mode == SLTA_SCALE_BOTH){
+      double rr_target = MathMax(InpSLTA_MinRR, InpSLTA_TargetRR);
+      double tp_needed = sl_pts1 * rr_target;
+      tp_pts1 = MathMax(tp_pts0, tp_needed);
+    }
+    if(InpSLTA_MaxTPPts > 0 && tp_pts1 > InpSLTA_MaxTPPts) tp_pts1 = InpSLTA_MaxTPPts;
+
+    double tp_px = (direction>0 ? entry_price + tp_pts1*point : entry_price - tp_pts1*point);
+    tp_price_io = NormalizePriceByTick(tp_px);
+    tp_pts1 = MathAbs(tp_price_io - entry_price)/point;
+  }else{
+    if(InpSLTA_Mode == SLTA_ADJUST_TP_KEEP_RR || InpSLTA_Mode == SLTA_SCALE_BOTH){
+      double rr = MathMax(InpSLTA_MinRR, InpSLTA_TargetRR);
+      tp_pts1 = sl_pts1 * rr;
+      if(InpSLTA_MaxTPPts > 0 && tp_pts1 > InpSLTA_MaxTPPts) tp_pts1 = InpSLTA_MaxTPPts;
+      double tp_px = (direction>0 ? entry_price + tp_pts1*point : entry_price - tp_pts1*point);
+      tp_price_io = NormalizePriceByTick(tp_px);
+      tp_pts1 = MathAbs(tp_price_io - entry_price)/point;
+    }
+  }
+
+  if((InpSLTA_Mode == SLTA_ADJUST_TP_KEEP_RR || InpSLTA_Mode == SLTA_SCALE_BOTH) && InpSLTA_MinRR > 0.0 && tp_pts1 > 0.0){
+    double rr_eff = tp_pts1 / sl_pts1;
+    if(rr_eff + 1e-9 < InpSLTA_MinRR){
+      if(InpSLTA_LogVerbose) PrintFormat("[SLTA] RR %.2f below MinRR %.2f after adjust — cancel.", rr_eff, InpSLTA_MinRR);
+      return !InpSLTA_StrictCancel;
+    }
+  }
+
+  double lots_new = CalculateLotSize(conf_for_sizing, sl_pts1 * point);
+  if(lots_new <= 0.0){
+    if(InpSLTA_LogVerbose) Print("[SLTA] Lot sizing failed after SL adjust — cancel.");
+    return !InpSLTA_StrictCancel;
+  }
+  lots_io = lots_new;
+
+  return true;
+}
+
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                            |
@@ -2625,25 +2733,29 @@ bool TryOpenPosition(int signal, double conf_eff, int reason_code, double ze_str
    
    // ----- lot sizing based on actual risk distance -----
    double lots_to_trade = CalculateLotSize((int)conf_eff, sl_dist);
-   if(lots_to_trade < MinLotSize) return false;
 
-   double entryPrice = 0; // OSR will populate this
+   // --- Provisional Entry/SL/TP from signal, before adjustment ---
+   double entryPrice = (signal > 0) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double slPrice, tpPrice;
-
-   // Set SL/TP based on an initial price estimate; OSR will refine it
-   double estimated_entry = (signal > 0) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
    if (signal > 0) {
-      slPrice = estimated_entry - sl_dist;
-      tpPrice = (Exit_FixedRR) ? estimated_entry + Fixed_RR * sl_dist : 0;
+      slPrice = entryPrice - sl_dist;
+      tpPrice = (Exit_FixedRR) ? entryPrice + Fixed_RR * sl_dist : 0;
    } else {
-      slPrice = estimated_entry + sl_dist;
-      tpPrice = (Exit_FixedRR) ? estimated_entry - Fixed_RR * sl_dist : 0;
+      slPrice = entryPrice + sl_dist;
+      tpPrice = (Exit_FixedRR) ? entryPrice - Fixed_RR * sl_dist : 0;
+   }
+   
+   // --- T033: Auto-adjust SL/TP to satisfy broker min-stops & RR; re-scale lots ---
+   if(!SLTA_AdjustAndRescale(signal, entryPrice, slPrice, tpPrice, lots_to_trade, (int)conf_eff))
+   {
+     if(InpSLTA_LogVerbose) Print("[SLTA_CANCEL] Could not meet broker min-stops / RR constraints within bounds.");
+     return false; // Cancel this attempt cleanly
    }
    
    g_last_comment = StringFormat("AAI|%.1f|%d|%d|%.1f|%.5f|%.5f|%.1f",
                                  conf_eff, (int)conf_eff, reason_code, ze_strength, slPrice, tpPrice, smc_conf);
                                  
-   double rr_calc = (sl_dist > 0 && tpPrice > 0) ? (MathAbs(tpPrice-estimated_entry)/sl_dist) : 0.0;
+   double rr_calc = (sl_dist > 0 && tpPrice > 0) ? (MathAbs(tpPrice-entryPrice)/sl_dist) : 0.0;
    
    DJ_Write(signal, conf_eff, reason_code, ze_strength, bc_bias, smc_sig, smc_conf, 
             g_vr_flag_for_bar, g_news_flag_for_bar, g_sp_hit_for_bar ? 1 : 0, 
@@ -2653,7 +2765,7 @@ bool TryOpenPosition(int signal, double conf_eff, int reason_code, double ze_str
             (g_rg_day_start_balance > 0 ? (-g_rg_day_realized_pl / g_rg_day_start_balance) * 100.0 : 0.0),
             -g_rg_day_realized_pl, g_rg_day_sl_hits, g_rg_consec_losses,
             (double)CurrentSpreadPoints(), 
-            lots_to_trade, sl_dist / point, (tpPrice>0?MathAbs(tpPrice-estimated_entry)/point:0), rr_calc, entry_mode);
+            lots_to_trade, sl_dist / point, (tpPrice>0?MathAbs(tpPrice-entryPrice)/point:0), rr_calc, entry_mode);
 
    MqlTradeResult tRes;
    bool sent = OSR_SendMarket(signal, lots_to_trade, entryPrice, slPrice, tpPrice, tRes);
