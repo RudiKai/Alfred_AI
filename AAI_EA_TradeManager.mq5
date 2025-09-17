@@ -48,14 +48,14 @@ int    AAI_dur_count   = 0;
 // ==================== /AAI METRICS ======================
 //+------------------------------------------------------------------+
 //| AAI_EA_Trade_Manager.mq5                                         |
-//|                    v4.5 - News Gate Added                        |
+//|                    v4.7 - Decision Journaling                    |
 //|                                                                  |
 //| (Consumes all data from the refactored AAI_Indicator_SignalBrain)|
 //|                                                                  |
 //| Copyright 2025, AlfredAI Project                                 |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "4.5"
+#property version   "4.7"
 #property description "Manages trades based on signals from the central SignalBrain indicator."
 #include <Trade\Trade.mqh>
 #include <Arrays\ArrayLong.mqh>
@@ -391,8 +391,12 @@ input group "Journaling"
 input bool     EnableJournaling     = true;
 input string   JournalFileName      = "AlfredAI_Journal.csv";
 input bool     JournalUseCommonFiles = true;
-input bool     EnableDecisionJournaling = false;
-input string   DecisionJournalFileName = "AlfredAI_Decisions.csv";
+
+// --- Decision Journaling (T026) ---
+input group "Decision Journaling"
+input bool   InpDJ_Enable      = false;
+input string InpDJ_FileName    = "AAI_Decisions.csv";
+input bool   InpDJ_Append      = true;
 
 //--- Globals
 CTrade    trade;
@@ -423,6 +427,10 @@ static datetime g_last_entry_bar_buy = 0, g_last_entry_bar_sell = 0;
 static ulong    g_last_send_sig_hash = 0;
 static ulong g_last_send_ms = 0;
 static datetime g_cool_until_buy = 0, g_cool_until_sell = 0;
+
+// --- T026: Per-bar flags for decision journaling ---
+static int g_vr_flag_for_bar   = 0;
+static int g_news_flag_for_bar = 0;
 
 // --- T012: Summary Counters ---
 static long g_entries      = 0;
@@ -517,39 +525,6 @@ bool UpdateSBCacheIfNewBar()
   g_sb.valid = true;
   return true;
 }
-
-//--- TICKET T022: New Volatility Regime Gate ---
-bool VolatilityRegimeGate(double &conf /* in/out */)
-{
-  if(!InpVR_Enable || InpVR_Mode==VR_OFF) return true;
-  double atrv[1], closev[1];
-  if(CopyBuffer(g_hATR_VR, 0, 1, 1, atrv) != 1) return true; // be permissive on read fail
-  
-  MqlRates rates[];
-  if(CopyRates(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1, 1, rates) != 1) return true;
-  closev[0] = rates[0].close;
-
-  if (closev[0] == 0) return true; // Avoid division by zero
-  
-  double atr_bps = (atrv[0] / closev[0]) * 10000.0;
-  bool out_of_band = (atr_bps < InpVR_MinBps || atr_bps > InpVR_MaxBps);
-
-  if(!out_of_band) return true;
-
-  if(InpVR_Mode == VR_REQUIRED){
-    AAI_Block("vr");
-    if(g_stamp_vr != g_lastBarTime){ g_blk_vr++; g_stamp_vr = g_lastBarTime; }
-    return false;
-  }
-  // preferred: penalize confidence; do not block
-  conf = MathMax(0.0, conf - InpVR_PrefPenalty);
-  return true;
-}
-
-
-// ====================== AAI JOURNAL HELPERS ======================
-// ... (rest of file is identical)
-
 
 // ====================== AAI JOURNAL HELPERS ======================
 #ifndef AAI_EA_LOG_DEFINED
@@ -725,7 +700,69 @@ void LogPerBarStatus(int sig, double conf, int reason, double ze, int bc)
     Print(logLine);
     AAI_AppendJournal(logLine);
 }
-//... (rest of the file is identical) ...
+
+//+------------------------------------------------------------------+
+//| T026: Decision Journaling CSV Helper                             |
+//+------------------------------------------------------------------+
+void DJ_Write(const int direction,
+              const double conf_eff,
+              const int sb_reason,
+              const double ze_strength,
+              const int bc_bias,
+              const int smc_sig,
+              const double smc_conf,
+              const int vr_flag,
+              const int news_flag,
+              const double spread_pts,
+              const double lots,
+              const double sl_pts,
+              const double tp_pts,
+              const double rr,
+              const string entry_mode)
+{
+  if(!InpDJ_Enable) return;
+
+  int flags = FILE_WRITE|FILE_READ|FILE_CSV|FILE_ANSI|FILE_COMMON;
+  int h = FileOpen(InpDJ_FileName, flags);
+  if(h == INVALID_HANDLE) return;
+
+  // Write header if file is empty or we’re not appending
+  if(FileSize(h) == 0 || !InpDJ_Append){
+    FileSeek(h, 0, SEEK_SET);
+    string header = "time,symbol,tf,dir,conf,sb_reason,ze_strength,bc_bias,smc_sig,smc_conf,vr_flag,news_flag,spread_pts,lots,sl_pts,tp_pts,rr,entry_mode\r\n";
+    FileWriteString(h, header);
+  }
+
+  // Always append a row at end
+  FileSeek(h, 0, SEEK_END);
+
+  datetime t = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1); // closed bar time
+  string tf  = TfLabel((ENUM_TIMEFRAMES)SignalTimeframe);
+
+  string row = StringFormat("%s,%s,%s,%d,%.0f,%d,%.1f,%d,%d,%.1f,%d,%d,%.0f,%.2f,%.0f,%.0f,%.2f,%s\r\n",
+    TimeToString(t, TIME_DATE|TIME_SECONDS),
+    _Symbol,
+    tf,
+    direction,
+    conf_eff,
+    sb_reason,
+    ze_strength,
+    bc_bias,
+    smc_sig,
+    smc_conf,
+    vr_flag,
+    news_flag,
+    spread_pts,
+    lots,
+    sl_pts,
+    tp_pts,
+    rr,
+    entry_mode
+  );
+  
+  FileWriteString(h, row);
+  FileClose(h);
+}
 
 
 //+------------------------------------------------------------------+
@@ -824,26 +861,8 @@ void AAI_RaiseHybridAlert(const string side, const double conf_eff, const double
 //+------------------------------------------------------------------+
 void JournalDecision(string reason)
 {
-    if(!EnableDecisionJournaling) return;
-
-    int file_handle = FileOpen(DecisionJournalFileName, FILE_READ|FILE_WRITE|FILE_CSV|(JournalUseCommonFiles ? FILE_COMMON : 0), ';');
-    if(file_handle == INVALID_HANDLE) return;
-
-    if(FileSize(file_handle) == 0)
-    {
-        FileWriteString(file_handle, "TimeLocal;TimeServer;Symbol;TF;Reason\n");
-    }
-    FileSeek(file_handle, 0, SEEK_END);
-
-    string line = StringFormat("%s;%s;%s;%s;%s\n",
-        TimeToString(TimeLocal(), TIME_DATE|TIME_SECONDS),
-        TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS),
-        _Symbol,
-        EnumToString(_Period),
-        reason
-    );
-    FileWriteString(file_handle, line);
-    FileClose(file_handle);
+    // Deprecated by AAI_Block which now handles its own journaling logic.
+    // This function is kept for backward compatibility if called elsewhere, but should be empty.
 }
 
 //+------------------------------------------------------------------+
@@ -851,70 +870,7 @@ void JournalDecision(string reason)
 //+------------------------------------------------------------------+
 void AAI_Block(const string reason)
 {
-   JournalDecision(reason); // Log every block decision if enabled
-   
-   string r = reason;
-   StringToLower(r);
-
-   // choose target counter + stamp by reason
-   if(StringFind(r, "overext") == 0)
-   {
-      if(g_stamp_over != g_lastBarTime){ g_blk_over++; g_stamp_over = g_lastBarTime; }
-   }
-   else if(r == "news")
-   {
-      if(g_stamp_news != g_lastBarTime){ g_blk_news++; g_stamp_news = g_lastBarTime; }
-   }
-   else if(r == "confidence")
-   {
-      if(g_stamp_conf != g_lastBarTime){ g_stamp_conf = g_lastBarTime; }
-   }
-   else if(r == "ze_required")
-   {
-      if(g_stamp_ze != g_lastBarTime){ g_blk_ze++; g_stamp_ze = g_lastBarTime; }
-   }
-   else if(r == "bc" || r == "bc_conflict" || r == "bc_required")
-   {
-      if(g_stamp_bc != g_lastBarTime){ g_blk_bc++; g_stamp_bc = g_lastBarTime; }
-   }
-   else if(r == "session")
-   {
-      if(g_stamp_sess != g_lastBarTime){ g_stamp_sess = g_lastBarTime; }
-   }
-   else if(r == "spread")
-   {
-      if(g_stamp_spd != g_lastBarTime){ g_blk_spread++; g_stamp_spd = g_lastBarTime; }
-   }
-   else if(r == "cooldown")
-   {
-      if(g_stamp_cool != g_lastBarTime){ g_stamp_cool = g_lastBarTime; }
-   }
-   else if(r == "same_bar")
-   {
-      if(g_stamp_bar != g_lastBarTime){ g_stamp_bar = g_lastBarTime; }
-   }
-   else if(r == "atr")
-   {
-      if(g_stamp_atr != g_lastBarTime){ g_stamp_atr = g_lastBarTime; }
-   }
-   else if(r == "smc" || r == "smc_required")
-   {
-      if(g_stamp_smc != g_lastBarTime){ g_blk_smc++; g_stamp_smc = g_lastBarTime; }
-   }
-   else if(r == "manual_approval")
-   {
-      if(g_stamp_approval != g_lastBarTime){ g_stamp_approval = g_lastBarTime; }
-   }
-   else if(r == "hybrid")
-   {
-      if(g_stamp_hyb != g_lastBarTime){ g_stamp_hyb = g_lastBarTime; }
-   }
-   else
-   {
-      if(g_stamp_none != g_lastBarTime){ g_stamp_none = g_lastBarTime; }
-   }
-
-   PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason);
+   // Deprecated by new Gate functions which handle their own logging/counting
 }
 
 //+------------------------------------------------------------------+
@@ -991,6 +947,7 @@ int OnInit()
    g_blk_over = 0;
    g_blk_spread = 0;
    g_blk_news = 0;
+   g_blk_vr = 0;
    g_summary_printed = false;
    g_sb.valid = false; // Initialize cache as invalid
 
@@ -1034,6 +991,10 @@ if(sb_handle == INVALID_HANDLE)
 
    g_hOverextMA = iMA(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, OverExt_MA_Period, 0, MODE_EMA, PRICE_CLOSE);
    if(g_hOverextMA == INVALID_HANDLE){ PrintFormat("%s Failed to create Overextension MA handle", INIT_ERROR); return(INIT_FAILED); }
+
+   // --- T022: Initialize Volatility Regime handle ---
+   g_hATR_VR = iATR(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, InpVR_ATR_Period);
+   if(g_hATR_VR == INVALID_HANDLE) { PrintFormat("%s Failed to create Volatility Regime ATR handle", INIT_ERROR); return(INIT_FAILED); }
    
    if(Hybrid_RequireApproval)
    {
@@ -1099,6 +1060,7 @@ void OnDeinit(const int reason)
    if(sb_handle != INVALID_HANDLE) IndicatorRelease(sb_handle);
    if(g_hATR != INVALID_HANDLE) IndicatorRelease(g_hATR);
    if(g_hOverextMA != INVALID_HANDLE) IndicatorRelease(g_hOverextMA);
+   if(g_hATR_VR != INVALID_HANDLE) IndicatorRelease(g_hATR_VR); // T022
 
    // --- T006: Clean up HUD Object ---
    ObjectDelete(0, HUD_OBJECT_NAME);
@@ -1366,214 +1328,371 @@ void OnTick()
        return;
    }
    
-   CheckForNewTrades();
+   EvaluateClosedBar();
 }
 
 
 //+------------------------------------------------------------------+
-//| Check & execute new entries                                      |
+//| >>> T025 GATE REFACTOR: Gate Functions <<<                       |
 //+------------------------------------------------------------------+
-void CheckForNewTrades()
+
+// --- Gate 1: Warmup ---
+bool GateWarmup(string &reason_id)
 {
-   // --- TICKET T021: Use cached data ---
-   int    direction    = g_sb.sig;
-   int    reason       = g_sb.reason;
-   int    smc_sig      = g_sb.smc_sig;
-   int    bc_bias      = g_sb.bc;
-   double final_conf   = g_sb.conf;
-   double ze_strength  = g_sb.ze;
-   double smc_conf     = g_sb.smc_conf;
-
-   // --- Update Visuals and Journaling with the cached data ---
-   LogPerBarStatus(direction, final_conf, reason, ze_strength, bc_bias);
-   UpdateHUD(direction, final_conf, reason, ze_strength, bc_bias);
-
-
-   // --- EA Warmup Gate (T003) ---
-   long bars_avail = Bars(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe);
-   if (bars_avail < WarmupBars)
-   {
-       datetime barTime = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 0);
-       if (g_last_ea_warmup_log_time != barTime)
-       {
-           PrintFormat("[WARMUP] t=%s sb_handle_ok=%d need=%d have=%d",
+    long bars_avail = Bars(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe);
+    if(bars_avail < WarmupBars)
+    {
+        datetime barTime = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 0);
+        if(g_last_ea_warmup_log_time != barTime)
+        {
+            PrintFormat("[WARMUP] t=%s sb_handle_ok=%d need=%d have=%d",
                        TimeToString(barTime), (sb_handle != INVALID_HANDLE), WarmupBars, (int)bars_avail);
-           g_last_ea_warmup_log_time = barTime;
-       }
-       return;
-   }
-   
-   // --- T010: Spread Gate ---
-   int currentSpread = CurrentSpreadPoints();
-   if (currentSpread > MaxSpreadPoints)
-   {
-       datetime barTime = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1);
-       static datetime last_spread_log_time = 0;
-       if (barTime != last_spread_log_time)
-       {
-           PrintFormat("[SPREAD_BLK] t=%s spread=%d max=%d", TimeToString(barTime), currentSpread, MaxSpreadPoints);
-           last_spread_log_time = barTime;
-       }
-       AAI_Block("spread");
-       return;
-   }
-   
-   // --- News Gate (T024) ---
-   datetime server_now = TimeCurrent();
-   if(!g_newsGate.CheckGate(server_now, final_conf))
-   {
-      AAI_Block("news");
-      return;
-   }
+            g_last_ea_warmup_log_time = barTime;
+        }
+        reason_id = "warmup";
+        return false;
+    }
+    return true;
+}
 
-   // --- Signal Gate ---
-   if(direction == 0) return;
+// --- Gate 2: Spread ---
+bool GateSpread(string &reason_id)
+{
+    int currentSpread = CurrentSpreadPoints();
+    if(currentSpread > MaxSpreadPoints)
+    {
+        static datetime last_spread_log_time = 0;
+        datetime barTime = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1);
+        if(barTime != last_spread_log_time)
+        {
+            PrintFormat("[SPREAD_BLK] t=%s spread=%d max=%d", TimeToString(barTime), currentSpread, MaxSpreadPoints);
+            last_spread_log_time = barTime;
+        }
+        reason_id = "spread";
+        if(g_stamp_spd != g_sb.closed_bar_time) { g_blk_spread++; g_stamp_spd = g_sb.closed_bar_time; }
+        return false;
+    }
+    return true;
+}
 
-   // --- Session Gate (Server Time) ---
-   bool sess_ok = true;
-   if(SessionEnable)
-   {
-      MqlDateTime dt;
-      TimeToStruct(TimeTradeServer(), dt);
-      const int hh = dt.hour;
-      if(SessionStartHourServer == SessionEndHourServer) sess_ok = true;
-      else sess_ok = (SessionStartHourServer <= SessionEndHourServer)
-                 ? (hh >= SessionStartHourServer && hh < SessionEndHourServer)
-                 : (hh >= SessionStartHourServer || hh < SessionEndHourServer);
-   }
-   if(!sess_ok) { AAI_Block("session"); return; }
-   
-   datetime signal_bar_time = g_sb.closed_bar_time;
-   
-   // --- T011 & TICKET #3: Over-extension Gate ---
-   static datetime last_overext_log_time = 0;
-   double mid = 0, atr = 0, px = 0;
-   double _tmp_ma_[1];
-   if (CopyBuffer(g_hOverextMA, 0, 1, 1, _tmp_ma_) == 1)  mid = _tmp_ma_[0]; else mid = 0.0;
+// --- Gate 3: News ---
+bool GateNews(double &conf_io, string &reason_id)
+{
+    datetime server_now = TimeCurrent();
+    // CheckGate will modify conf_io if mode is PREFERRED
+    {
+        reason_id = "news";
+        if(g_stamp_news != g_sb.closed_bar_time){ g_blk_news++; g_stamp_news = g_sb.closed_bar_time; }
+        return false; // Blocked
+    }
+    return true; // Passed (confidence may have been penalized)
+}
 
-   double _tmp_atr_[1];
-   if (CopyBuffer(g_hATR, 0, 1, 1, _tmp_atr_) == 1)       atr = _tmp_atr_[0];
-   else atr = 0.0;
+// --- Gate 4: Session ---
+bool GateSession(string &reason_id)
+{
+    if(SessionEnable)
+    {
+        MqlDateTime dt;
+        TimeToStruct(TimeTradeServer(), dt);
+        const int hh = dt.hour;
+        bool sess_ok = (SessionStartHourServer == SessionEndHourServer)
+                     ? true
+                     : (SessionStartHourServer <= SessionEndHourServer)
+                       ? (hh >= SessionStartHourServer && hh < SessionEndHourServer)
+                       : (hh >= SessionStartHourServer || hh < SessionEndHourServer);
+        if(!sess_ok)
+        {
+            reason_id = "session";
+            if(g_stamp_sess != g_sb.closed_bar_time){ g_stamp_sess = g_sb.closed_bar_time; }
+            return false;
+        }
+    }
+    return true;
+}
 
-   px = iClose(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1);
-   
-   if(mid > 0 && atr > 0 && px > 0)
-   {
-      double up = mid + OverExt_ATR_Mult * atr;
-      double dn = mid - OverExt_ATR_Mult * atr;
-      bool is_over_long = (direction > 0 && px > up);
-      bool is_over_short = (direction < 0 && px < dn);
-      if(OverExtMode == HardBlock)
-      {
-         if(is_over_long || is_over_short)
-         {
-            if(signal_bar_time != last_overext_log_time)
+// --- Gate 5: Over-extension ---
+bool GateOverExtension(string &reason_id)
+{
+    static datetime last_overext_log_time = 0;
+    double mid = 0, atr = 0, px = 0;
+    
+    double _tmp_ma_[1];
+    if(CopyBuffer(g_hOverextMA, 0, 1, 1, _tmp_ma_) == 1) mid = _tmp_ma_[0];
+    
+    double _tmp_atr_[1];
+    if(CopyBuffer(g_hATR, 0, 1, 1, _tmp_atr_) == 1) atr = _tmp_atr_[0];
+    
+    px = iClose(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1);
+    
+    if(mid > 0 && atr > 0 && px > 0)
+    {
+        double up = mid + OverExt_ATR_Mult * atr;
+        double dn = mid - OverExt_ATR_Mult * atr;
+        const int direction = g_sb.sig;
+        
+        bool is_over_long = (direction > 0 && px > up);
+        bool is_over_short = (direction < 0 && px < dn);
+
+        if(OverExtMode == HardBlock)
+        {
+            if(is_over_long || is_over_short)
             {
-               PrintFormat("[OVEREXT_BLK] t=%s dir=%d px=%.5f up=%.5f dn=%.5f", TimeToString(signal_bar_time), direction, px, up, dn);
-               last_overext_log_time = signal_bar_time;
+                if(g_sb.closed_bar_time != last_overext_log_time)
+                {
+                    PrintFormat("[OVEREXT_BLK] t=%s dir=%d px=%.5f up=%.5f dn=%.5f", TimeToString(g_sb.closed_bar_time), direction, px, up, dn);
+                    last_overext_log_time = g_sb.closed_bar_time;
+                }
+                reason_id = "overext";
+                if(g_stamp_over != g_sb.closed_bar_time){ g_blk_over++; g_stamp_over = g_sb.closed_bar_time; }
+                return false;
             }
-            AAI_Block("overext");
-            return;
-         }
-      }
-      else // WaitForBand
-      {
-         if(is_over_long || is_over_short)
-         {
-            g_overext_wait = OverExt_WaitBars;
-         }
-         
-         if(g_overext_wait > 0)
-         {
-            if(px >= dn && px <= up) // Price re-entered the band
+        }
+        else // WaitForBand
+        {
+            if(is_over_long || is_over_short)
             {
-               g_overext_wait = 0;
+                g_overext_wait = OverExt_WaitBars;
             }
-            else
+            
+            if(g_overext_wait > 0)
             {
-               // TICKET #3 FIX: Decrement only once per new signal bar
-               if(signal_bar_time != g_last_overext_dec_sigbar)
-               {
-                  g_overext_wait--;
-                  g_last_overext_dec_sigbar = signal_bar_time;
-               }
-               
-               if(signal_bar_time != last_overext_log_time)
-               {
-                  PrintFormat("[OVEREXT_WAIT] t=%s left=%d dir=%d", TimeToString(signal_bar_time), g_overext_wait, direction);
-                  last_overext_log_time = signal_bar_time;
-               }
-               AAI_Block("overext");
-               return;
+                if(px >= dn && px <= up) // Price re-entered the band
+                {
+                    g_overext_wait = 0;
+                }
+                else
+                {
+                    if(g_sb.closed_bar_time != g_last_overext_dec_sigbar)
+                    {
+                        g_overext_wait--;
+                        g_last_overext_dec_sigbar = g_sb.closed_bar_time;
+                    }
+                    
+                    if(g_sb.closed_bar_time != last_overext_log_time)
+                    {
+                        PrintFormat("[OVEREXT_WAIT] t=%s left=%d dir=%d", TimeToString(g_sb.closed_bar_time), g_overext_wait, direction);
+                        last_overext_log_time = g_sb.closed_bar_time;
+                    }
+                    reason_id = "overext";
+                    if(g_stamp_over != g_sb.closed_bar_time){ g_blk_over++; g_stamp_over = g_sb.closed_bar_time; }
+                    return false;
+                }
             }
-         }
-      }
-   }
+        }
+    }
+    return true;
+}
 
-    // --- Adapted Gating Logic ---
-    // ZE Gate
+// --- Gate 6: Volatility Regime ---
+bool GateVolatility(double &conf_io, string &reason_id)
+{
+    if(!InpVR_Enable || InpVR_Mode == VR_OFF) return true;
+    
+    double atrv[1];
+    if(g_hATR_VR == INVALID_HANDLE || CopyBuffer(g_hATR_VR, 0, 1, 1, atrv) != 1) return true; // Fail open
+    
+    MqlRates rates[];
+    if(CopyRates(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1, 1, rates) != 1 || rates[0].close == 0) return true; // Fail open
+    
+    double atr_bps = (atrv[0] / rates[0].close) * 10000.0;
+    bool out_of_band = (atr_bps < InpVR_MinBps || atr_bps > InpVR_MaxBps);
+    
+    if(out_of_band) g_vr_flag_for_bar = 1;
+
+    if(!out_of_band) return true;
+
+    if(InpVR_Mode == VR_REQUIRED) {
+        reason_id = "vr";
+        if(g_stamp_vr != g_sb.closed_bar_time){ g_blk_vr++; g_stamp_vr = g_sb.closed_bar_time; }
+        return false;
+    }
+    
+    // Mode is PREFERRED
+    conf_io = MathMax(0.0, conf_io - InpVR_PrefPenalty);
+    return true;
+}
+
+// --- Gate 7: ZoneEngine ---
+bool GateZE(const int direction, const double ze_strength, string &reason_id)
+{
     if(ZE_Gate == ZE_REQUIRED && ze_strength < ZE_MinStrength)
     {
-        AAI_Block("ZE_REQUIRED");
-        return;
+        reason_id = "ZE_REQUIRED";
+        if(g_stamp_ze != g_sb.closed_bar_time){ g_blk_ze++; g_stamp_ze = g_sb.closed_bar_time; }
+        return false;
     }
+    return true;
+}
 
-    // SMC Gate
+// --- Gate 8: SMC ---
+bool GateSMC(const int direction, const int smc_sig, const double smc_conf, string &reason_id)
+{
     if(SMC_Mode == SMC_REQUIRED)
     {
         if(smc_sig != direction || smc_conf < SMC_MinConfidence)
         {
-            AAI_Block("SMC_REQUIRED");
-            return;
+            reason_id = "SMC_REQUIRED";
+            if(g_stamp_smc != g_sb.closed_bar_time){ g_blk_smc++; g_stamp_smc = g_sb.closed_bar_time; }
+            return false;
         }
     }
-    
-    // BC Gate
+    return true;
+}
+
+// --- Gate 9: BiasCompass ---
+bool GateBC(const int direction, const int bc_bias, string &reason_id)
+{
     if(BC_AlignMode == BC_REQUIRED)
     {
         if(bc_bias != direction)
         {
-            AAI_Block("BC_REQUIRED");
-            return;
+            reason_id = "BC_REQUIRED";
+            if(g_stamp_bc != g_sb.closed_bar_time){ g_blk_bc++; g_stamp_bc = g_sb.closed_bar_time; }
+            return false;
         }
     }
+    return true;
+}
 
-   // --- Final Confidence Gate (uses confidence directly from SignalBrain) ---
-   if(final_conf < MinConfidence) { AAI_Block("confidence"); return; }
-   
-   // --- TICKET #3 FIX: Cooldown Gate ---
-   int secs = PeriodSeconds((ENUM_TIMEFRAMES)SignalTimeframe);
-   datetime until = (direction > 0) ? g_cool_until_buy : g_cool_until_sell;
-   int delta = (int)(until - signal_bar_time);
-   int bars_left = (delta <= 0 || secs <= 0) ? 0 : ( (delta + secs - 1) / secs );
-   if(bars_left > 0) { AAI_Block("cooldown"); return; }
-   
-   // --- TICKET #3 FIX: Per-Bar Debounce Gate ---
-   if(PerBarDebounce && ((direction > 0) ? (g_last_entry_bar_buy == signal_bar_time) : (g_last_entry_bar_sell == signal_bar_time)))
-   {
-      AAI_Block("same_bar");
-      return;
-   }
+// --- Gate 10: Confidence ---
+bool GateConfidence(const double conf_eff, string &reason_id)
+{
+    if(conf_eff < MinConfidence)
+    {
+        reason_id = "confidence";
+        if(g_stamp_conf != g_sb.closed_bar_time){ g_stamp_conf = g_sb.closed_bar_time; }
+        return false;
+    }
+    return true;
+}
 
-   // --- Trigger Gate ---
-   string trigger = "";
-   double sbSig_prev=0;
-   // We need to read the previous bar's signal from SB to detect an edge
-   Read1(sb_handle, SB_BUF_SIGNAL, SB_ReadShift + 1, sbSig_prev, "SB_Prev");
+// --- Gate 11: Cooldown ---
+bool GateCooldown(const int direction, string &reason_id)
+{
+    int secs = PeriodSeconds((ENUM_TIMEFRAMES)SignalTimeframe);
+    datetime until = (direction > 0) ? g_cool_until_buy : g_cool_until_sell;
+    int delta = (int)(until - g_sb.closed_bar_time);
+    int bars_left = (delta <= 0 || secs <= 0) ? 0 : ((delta + secs - 1) / secs);
+    if(bars_left > 0)
+    {
+        reason_id = "cooldown";
+        if(g_stamp_cool != g_sb.closed_bar_time){ g_stamp_cool = g_sb.closed_bar_time; }
+        return false;
+    }
+    return true;
+}
 
-   bool is_edge = (direction != (int)sbSig_prev);
-   if(EntryMode == FirstBarOrEdge && !g_bootstrap_done) trigger = "bootstrap";
-   else if(is_edge) trigger = "edge";
-   if(trigger == "") { AAI_Block("no_trigger"); return; }
-   
-   // --- Position Gate ---
-   if(PositionSelect(_Symbol)) return;
-   
-   // --- All Gates Passed ---
-   if(TryOpenPosition(direction, 0, final_conf, reason, ze_strength, smc_conf))
-   {
-      if(trigger == "bootstrap") g_bootstrap_done = true;
-   }
+// --- Gate 12: Debounce ---
+bool GateDebounce(const int direction, string &reason_id)
+{
+    if(PerBarDebounce)
+    {
+        bool is_duplicate = (direction > 0) 
+                            ? (g_last_entry_bar_buy == g_sb.closed_bar_time) 
+                            : (g_last_entry_bar_sell == g_sb.closed_bar_time);
+        if(is_duplicate)
+        {
+            reason_id = "same_bar";
+            if(g_stamp_bar != g_sb.closed_bar_time){ g_stamp_bar = g_sb.closed_bar_time; }
+            return false;
+        }
+    }
+    return true;
+}
+
+// --- Gate 13: Position ---
+bool GatePosition(string &reason_id)
+{
+    if(PositionSelect(_Symbol))
+    {
+        reason_id = "position_exists";
+        return false;
+    }
+    return true;
+}
+
+// --- Gate 14: Trigger ---
+bool GateTrigger(const int direction, const int prev_sb_sig, string &reason_id)
+{
+    bool is_edge = (direction != prev_sb_sig);
+    if(EntryMode == FirstBarOrEdge && !g_bootstrap_done)
+    {
+        return true; // Bootstrap trigger
+    }
+    if(is_edge)
+    {
+        return true; // Edge trigger
+    }
+    
+    reason_id = "no_trigger";
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| >>> T025 REFACTOR: Main evaluation flow for a closed bar <<<     |
+//+------------------------------------------------------------------+
+void EvaluateClosedBar()
+{
+    // --- 0. Get cached data from SignalBrain for this bar ---
+    const int    direction   = g_sb.sig;
+    double       conf_eff    = g_sb.conf; // This can be modified by gates
+    const int    reason_sb   = g_sb.reason;
+    const double ze_strength = g_sb.ze;
+    const int    smc_sig     = g_sb.smc_sig;
+    const double smc_conf    = g_sb.smc_conf;
+    const int    bc_bias     = g_sb.bc;
+
+    // --- Log and Update HUD with the raw state for this bar ---
+    LogPerBarStatus(direction, conf_eff, reason_sb, ze_strength, bc_bias);
+    UpdateHUD(direction, conf_eff, reason_sb, ze_strength, bc_bias);
+    
+    // --- T026: Reset per-bar flags ---
+    g_vr_flag_for_bar = 0;
+    g_news_flag_for_bar = 0;
+    
+    // --- Signal Gate: If no signal, we're done for this bar. ---
+    if(direction == 0)
+    {
+        return;
+    }
+    
+    string reason_id; // To be populated by a failing gate
+
+    // --- Execute Gate Chain ---
+    if(!GateWarmup(reason_id))                  { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
+    if(!GateSpread(reason_id))                  { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
+    if(!GateNews(conf_eff, reason_id))          { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
+    if(!GateSession(reason_id))                 { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
+    if(!GateOverExtension(reason_id))           { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
+    if(!GateVolatility(conf_eff, reason_id))    { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
+    if(!GateZE(direction, ze_strength, reason_id)) { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
+    if(!GateSMC(direction, smc_sig, smc_conf, reason_id)) { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
+    if(!GateBC(direction, bc_bias, reason_id))  { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
+    if(!GateConfidence(conf_eff, reason_id))    { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
+    if(!GateCooldown(direction, reason_id))     { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
+    if(!GateDebounce(direction, reason_id))     { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
+    if(!GatePosition(reason_id))                { /* No block log needed */ return; }
+    
+    // GateTrigger requires the previous bar's signal
+    double prev_sig_raw = 0;
+    Read1(sb_handle, SB_BUF_SIGNAL, SB_ReadShift + 1, prev_sig_raw, "SB_Prev");
+    if(!GateTrigger(direction, (int)prev_sig_raw, reason_id)) { /* No block log needed */ return; }
+    
+    // --- Determine Entry Mode for Journaling ---
+    string entry_mode = "";
+    bool is_bootstrap_trigger = (EntryMode == FirstBarOrEdge && !g_bootstrap_done);
+    if(is_bootstrap_trigger) entry_mode = "bootstrap";
+    else entry_mode = "edge";
+
+    // --- All Gates Passed ---
+    if(TryOpenPosition(direction, conf_eff, reason_sb, ze_strength, bc_bias, smc_sig, smc_conf, entry_mode))
+    {
+        if(is_bootstrap_trigger)
+        {
+            g_bootstrap_done = true;
+        }
+    }
 }
 //... (rest of the file is identical) ...
 //+------------------------------------------------------------------+
@@ -1651,7 +1770,7 @@ void SendTelegramAlert(const string side, const double conf_eff, const double ze
 //+------------------------------------------------------------------+
 //| Attempts to open a trade and returns true on success             |
 //+------------------------------------------------------------------+
-bool TryOpenPosition(int signal, double conf_raw_unused, double conf_eff, int reason_code, double ze_strength, double smc_score)
+bool TryOpenPosition(int signal, double conf_eff, int reason_code, double ze_strength, int bc_bias, int smc_sig, double smc_conf, string entry_mode)
 {
    // ----- tick / basics -----
    MqlTick t;
@@ -1685,14 +1804,13 @@ bool TryOpenPosition(int signal, double conf_raw_unused, double conf_eff, int re
 
       if(Exit_FixedRR)
       {
-         // risk distance is entry - sl, but ensure at least min stop
          const double risk_dist = MathMax(entry - sl, min_stop_dist);
          tp = NormalizeDouble(entry + Fixed_RR * risk_dist, digs);
          rr = Fixed_RR;
       }
       else
       {
-         tp = 0.0; // keep your non-FixedRR behavior
+         tp = 0.0;
       }
    }
    else if(signal < 0) // SELL
@@ -1707,12 +1825,11 @@ bool TryOpenPosition(int signal, double conf_raw_unused, double conf_eff, int re
       }
       else
       {
-         tp = 0.0; // keep your non-FixedRR behavior
+         tp = 0.0;
       }
    }
    else
    {
-      // neutral signal — nothing to do
       return false;
    }
 
@@ -1730,7 +1847,7 @@ bool TryOpenPosition(int signal, double conf_raw_unused, double conf_eff, int re
 
    // ----- Duplicate Guard (MS) -----
    ulong now_ms = GetTickCount64();
-   datetime current_bar_time = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1); // TICKET #3 FIX
+   datetime current_bar_time = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1);
    string   hash_str = StringFormat("%I64d|%d|%.*f", (long)current_bar_time, signal, digs, entry);
    ulong    sig_h    = StringToULongHash(hash_str);
    if(DuplicateGuardMs > 0 && g_last_send_sig_hash == sig_h && (now_ms - g_last_send_ms) < DuplicateGuardMs)
@@ -1749,9 +1866,17 @@ bool TryOpenPosition(int signal, double conf_raw_unused, double conf_eff, int re
    double lots_to_trade = CalculateLotSize((int)conf_eff, MathAbs(entry - sl));
    if(lots_to_trade < MinLotSize) return false;
 
+   // T026: Decision Journaling Hook
+   double sl_pts = MathAbs(entry-sl) / point;
+   double tp_pts = (tp > 0) ? MathAbs(entry-tp) / point : -1.0;
+   double rr_calc = (sl_pts > 0 && tp_pts > 0) ? (tp_pts / sl_pts) : -1.0;
+   DJ_Write(signal, conf_eff, reason_code, ze_strength, bc_bias, smc_sig, smc_conf, 
+            g_vr_flag_for_bar, g_news_flag_for_bar, (double)CurrentSpreadPoints(), 
+            lots_to_trade, sl_pts, tp_pts, rr_calc, entry_mode);
+
    string signal_str = (signal == 1) ? "BUY" : "SELL";
    string comment = StringFormat("AAI|%.1f|%d|%d|%.1f|%.5f|%.5f|%.1f",
-                                 conf_eff, (int)conf_eff, reason_code, ze_strength, sl, tp, smc_score);
+                                 conf_eff, (int)conf_eff, reason_code, ze_strength, sl, tp, smc_conf);
 
    // ----- idea log (now with final, clamped SL/TP) -----
    PrintFormat("%s dir=%s entry=%.5f sl=%.5f tp=%.5f R=%.2f conf=%.0f ze=%.1f",
@@ -1772,7 +1897,7 @@ bool TryOpenPosition(int signal, double conf_raw_unused, double conf_eff, int re
                PrintFormat("[WAIT_APPROVAL] key=%s", gv_key);
                last_approval_wait_log = barTime;
            }
-           AAI_Block("manual_approval");
+           if(g_stamp_approval != g_sb.closed_bar_time){ g_stamp_approval = g_sb.closed_bar_time; }
            return false;
        }
        g_entries++;
@@ -1783,14 +1908,13 @@ bool TryOpenPosition(int signal, double conf_raw_unused, double conf_eff, int re
    // ----- HYBRID HOURS SWITCH -----
    if(!AAI_HourDayAutoOK())
    {
-      // Get SMC conf from SB data for the alert
       double smc_conf_val = 0.0;
       Read1(sb_handle, SB_BUF_SMC_CONF, MathMax(1, SB_ReadShift), smc_conf_val, "SB_SMC_Alert");
 
-      int    spread_pts = CurrentSpreadPoints();
+      int    spread_pts_now = CurrentSpreadPoints();
       double atr_pips   = (pip_size > 0.0 ? atr_val_raw / pip_size : 0.0);
-      AAI_RaiseHybridAlert(signal_str, conf_eff, ze_strength, smc_conf_val, spread_pts, atr_pips, entry, sl, tp);
-      AAI_Block("hybrid");
+      AAI_RaiseHybridAlert(signal_str, conf_eff, ze_strength, smc_conf_val, spread_pts_now, atr_pips, entry, sl, tp);
+      if(g_stamp_hyb != g_sb.closed_bar_time){ g_stamp_hyb = g_sb.closed_bar_time; }
       return false;
    }
 
@@ -2106,3 +2230,4 @@ void AddToLoggedList(ulong position_id)
    g_logged_positions_total = new_size;
 }
 //+------------------------------------------------------------------+
+
