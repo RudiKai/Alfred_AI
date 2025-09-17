@@ -48,14 +48,14 @@ int    AAI_dur_count   = 0;
 // ==================== /AAI METRICS ======================
 //+------------------------------------------------------------------+
 //| AAI_EA_Trade_Manager.mq5                                         |
-//|                    v5.0 - Inter-Market Gate                      |
+//|                    v5.1 - Global Risk Guard                      |
 //|                                                                  |
 //| (Consumes all data from the refactored AAI_Indicator_SignalBrain)|
 //|                                                                  |
 //| Copyright 2025, AlfredAI Project                                 |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "5.0"
+#property version   "5.1"
 #property description "Manages trades based on signals from the central SignalBrain indicator."
 #include <Trade\Trade.mqh>
 #include <Arrays\ArrayLong.mqh>
@@ -425,6 +425,21 @@ input double         InpIMC2_Weight           = 1.0;
 input double         InpIMC_MinSupport        = 0.50;
 input int            InpIMC_PrefPenalty       = 4;
 
+// --- Global Risk Guard (T030) ---
+input group "Global Risk Guard"
+enum ENUM_RG_Mode { RG_OFF=0, RG_REQUIRED=1, RG_PREFERRED=2 };
+input bool         InpRG_Enable               = true;
+input ENUM_RG_Mode InpRG_Mode                 = RG_REQUIRED;
+input int          InpRG_ResetHourServer      = 0;
+input double       InpRG_MaxDailyLossPct      = 2.0;
+input double       InpRG_MaxDailyLossMoney    = 0.0;
+input int          InpRG_MaxSLHits            = 0;
+input int          InpRG_MaxConsecLosses      = 3;
+enum ENUM_RG_BlockUntil { RG_BLOCK_TIL_END_OF_DAY=0, RG_BLOCK_FOR_HOURS=1 };
+input ENUM_RG_BlockUntil InpRG_BlockUntil     = RG_BLOCK_TIL_END_OF_DAY;
+input int          InpRG_BlockHours           = 4;
+input int          InpRG_PrefPenalty          = 5;
+
 //--- Confluence Module Inputs (M15 Baseline) ---
 input group "Confluence Modules"
 input ENUM_BC_ALIGN_MODE BC_AlignMode   = BC_REQUIRED;
@@ -484,6 +499,7 @@ static int    g_news_flag_for_bar = 0;
 static bool   g_sp_hit_for_bar    = false;
 static bool   g_imc_flag_for_bar  = false;
 static double g_imc_support       = 0.0;
+static bool   g_rg_flag_for_bar   = false;
 
 
 // --- T028: Adaptive Spread State ---
@@ -496,6 +512,15 @@ int      g_as_hist_pos            = 0;
 bool     g_as_exceeded_for_bar    = false;
 double   g_as_cap_pts_last        = 0.0;
 
+// --- T030: Global Risk Guard State ---
+datetime g_rg_day_anchor_time   = 0;
+double   g_rg_day_start_balance = 0.0;
+double   g_rg_day_realized_pl   = 0.0;
+int      g_rg_day_sl_hits       = 0;
+int      g_rg_consec_losses     = 0;
+bool     g_rg_block_active      = false;
+datetime g_rg_block_until       = 0;
+
 
 // --- T012: Summary Counters ---
 static long g_entries      = 0;
@@ -504,6 +529,7 @@ static long g_losses       = 0;
 static long g_blk_ze       = 0;
 static long g_blk_bc       = 0;
 static long g_blk_imc      = 0; // T029
+static long g_blk_risk     = 0; // T030
 static long g_blk_over     = 0;
 static long g_blk_spread   = 0;
 static long g_blk_aspread  = 0; // T028
@@ -517,6 +543,7 @@ datetime g_stamp_conf  = 0;
 datetime g_stamp_ze    = 0;
 datetime g_stamp_bc    = 0;
 datetime g_stamp_imc   = 0; // T029
+datetime g_stamp_risk  = 0; // T030
 datetime g_stamp_over  = 0;
 datetime g_stamp_sess  = 0;
 datetime g_stamp_spd   = 0;
@@ -546,7 +573,7 @@ datetime g_stamp_hyb = 0;     // once-per-bar stamp
 void PrintSummary()
 {
     if(g_summary_printed) return;
-    PrintFormat("AAI_SUMMARY|entries=%d|wins=%d|losses=%d|ze_blk=%d|bc_blk=%d|smc_blk=%d|overext_blk=%d|spread_blk=%d|aspread_blk=%d|vr_blk=%d|news_blk=%d|sp_blk=%d|imc_blk=%d",
+    PrintFormat("AAI_SUMMARY|entries=%d|wins=%d|losses=%d|ze_blk=%d|bc_blk=%d|smc_blk=%d|overext_blk=%d|spread_blk=%d|aspread_blk=%d|vr_blk=%d|news_blk=%d|sp_blk=%d|imc_blk=%d|risk_blk=%d",
                 g_entries,
                 g_wins,
                 g_losses,
@@ -559,7 +586,8 @@ void PrintSummary()
                 g_blk_vr,
                 g_blk_news,
                 g_blk_sp,
-                g_blk_imc);
+                g_blk_imc,
+                g_blk_risk);
     g_summary_printed = true;
 }
 
@@ -1020,6 +1048,38 @@ double CalculateLotSize(int confidence, double sl_distance_price)
 }
 
 //+------------------------------------------------------------------+
+//| >>> T030: Risk Guard Helpers <<<                                 |
+//+------------------------------------------------------------------+
+void RG_ResetDay()
+{
+    MqlDateTime now;
+    TimeToStruct(TimeCurrent(), now);
+    
+    // Calculate the most recent reset time
+    MqlDateTime anchor_dt = now;
+    anchor_dt.hour = InpRG_ResetHourServer;
+    anchor_dt.min = 0;
+    anchor_dt.sec = 0;
+    
+    datetime candidate_anchor = StructToTime(anchor_dt);
+    if(candidate_anchor > TimeCurrent())
+    {
+        candidate_anchor -= 86400; // It's tomorrow's anchor, use yesterday's
+    }
+    
+    g_rg_day_anchor_time = candidate_anchor;
+    g_rg_day_start_balance = AccountInfoDouble(ACCOUNT_BALANCE);
+    g_rg_day_realized_pl = 0.0;
+    g_rg_day_sl_hits = 0;
+    // g_rg_consec_losses persists across days unless reset by a win
+    
+    g_rg_block_active = false;
+    g_rg_block_until = 0;
+    PrintFormat("[RISK_GUARD] Day rolled over. Anchor: %s, Start Balance: %.2f", TimeToString(g_rg_day_anchor_time), g_rg_day_start_balance);
+}
+
+
+//+------------------------------------------------------------------+
 //| Expert initialization                                            |
 //+------------------------------------------------------------------+
 int OnInit()
@@ -1037,6 +1097,7 @@ int OnInit()
    g_blk_vr = 0;
    g_blk_sp = 0;
    g_blk_imc = 0;
+   g_blk_risk = 0;
    g_summary_printed = false;
    g_sb.valid = false; // Initialize cache as invalid
 
@@ -1056,6 +1117,10 @@ g_as_hist_count = 0; g_as_hist_pos = 0;
 ArrayResize(g_as_samples, 0);
 g_as_tick_ctr = 0;
 g_as_forming_bar_time = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 0);
+
+// --- T030: Init Risk Guard state ---
+RG_ResetDay();
+g_rg_consec_losses = 0; // Full reset on init
 
 // --- TICKET #2: Create the single, centralized SignalBrain handle ---
 sb_handle = iCustom(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, AAI_Ind("AAI_Indicator_SignalBrain"),
@@ -1304,6 +1369,27 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
    // --- AAI METRICS + EXEC JOURNAL ---
    if(trans.type == TRADE_TRANSACTION_DEAL_ADD && HistoryDealSelect(trans.deal))
    {
+      // --- T030: Update Risk Guard state on closed deals ---
+      if((ulong)HistoryDealGetInteger(trans.deal, DEAL_MAGIC) == MagicNumber &&
+         HistoryDealGetInteger(trans.deal, DEAL_ENTRY) == DEAL_ENTRY_OUT)
+      {
+         datetime deal_time = (datetime)HistoryDealGetInteger(trans.deal, DEAL_TIME);
+         if(deal_time >= g_rg_day_anchor_time)
+         {
+            double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT) + 
+                            HistoryDealGetDouble(trans.deal, DEAL_SWAP) + 
+                            HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
+
+            g_rg_day_realized_pl += profit;
+            if(profit < 0) g_rg_consec_losses++; else g_rg_consec_losses = 0;
+            
+            if((ENUM_DEAL_REASON)HistoryDealGetInteger(trans.deal, DEAL_REASON) == DEAL_REASON_SL)
+            {
+               g_rg_day_sl_hits++;
+            }
+         }
+      }
+
       // EXEC on entry (print once)
       if(HistoryDealGetInteger(trans.deal, DEAL_ENTRY) == DEAL_ENTRY_IN)
       {
@@ -1653,7 +1739,71 @@ bool GateNews(double &conf_io, string &reason_id)
     return true; // Passed (confidence may have been penalized)
 }
 
-// --- Gate 4: Session ---
+// --- Gate 4: Risk Guard (T030) ---
+bool GateRiskGuard(double &conf_io, string &reason_id)
+{
+  g_rg_flag_for_bar = false;
+  if(!InpRG_Enable || InpRG_Mode==RG_OFF) return true;
+
+  // Rollover check
+  MqlDateTime now;
+  TimeToStruct(TimeCurrent(), now);
+  MqlDateTime anchor_dt = now;
+  anchor_dt.hour = InpRG_ResetHourServer;
+  anchor_dt.min = 0;
+  anchor_dt.sec = 0;
+  datetime current_anchor = StructToTime(anchor_dt);
+  if(current_anchor > TimeCurrent()) current_anchor -= 86400;
+  if(current_anchor != g_rg_day_anchor_time) RG_ResetDay();
+
+
+  // If currently blocked and block time not expired, block
+  if(g_rg_block_active && (InpRG_BlockUntil==RG_BLOCK_TIL_END_OF_DAY || TimeCurrent() < g_rg_block_until))
+  {
+    g_rg_flag_for_bar = true;
+    reason_id = "risk";
+    if(g_stamp_risk != g_sb.closed_bar_time) { g_blk_risk++; g_stamp_risk = g_sb.closed_bar_time; }
+    return false;
+  }
+  
+  // If a temporary block expired, unblock
+  if(g_rg_block_active && InpRG_BlockUntil==RG_BLOCK_FOR_HOURS && TimeCurrent() >= g_rg_block_until)
+  {
+    g_rg_block_active = false;
+  }
+
+  // Compute running % drawdown vs start-of-day balance
+  double startBal = (g_rg_day_start_balance>0.0 ? g_rg_day_start_balance : AccountInfoDouble(ACCOUNT_BALANCE));
+  double dd_pct   = (startBal>0.0 ? (-g_rg_day_realized_pl / startBal) * 100.0 : 0.0);
+  double dd_abs   = -g_rg_day_realized_pl; // positive when loss
+
+  bool hit_pct  = (InpRG_MaxDailyLossPct   > 0.0 && dd_pct >= InpRG_MaxDailyLossPct);
+  bool hit_abs  = (InpRG_MaxDailyLossMoney > 0.0 && dd_abs >= InpRG_MaxDailyLossMoney);
+  bool hit_sls  = (InpRG_MaxSLHits         > 0    && g_rg_day_sl_hits >= InpRG_MaxSLHits);
+  bool hit_seq  = (InpRG_MaxConsecLosses   > 0    && g_rg_consec_losses >= InpRG_MaxConsecLosses);
+
+  bool tripped = (hit_pct || hit_abs || hit_sls || hit_seq);
+
+  if(tripped)
+  {
+    g_rg_flag_for_bar = true;
+    if(InpRG_Mode == RG_REQUIRED){
+      reason_id = "risk";
+      g_rg_block_active = true;
+      if(InpRG_BlockUntil==RG_BLOCK_FOR_HOURS) g_rg_block_until = TimeCurrent() + InpRG_BlockHours*3600;
+      if(g_stamp_risk != g_sb.closed_bar_time) { g_blk_risk++; g_stamp_risk = g_sb.closed_bar_time; }
+      return false; // hard block
+    } else {
+      conf_io = MathMax(0.0, conf_io - (double)InpRG_PrefPenalty); // soft penalty
+      return true;
+    }
+  }
+
+  return true;
+}
+
+
+// --- Gate 5: Session ---
 bool GateSession(string &reason_id)
 {
     if(SessionEnable)
@@ -1676,7 +1826,7 @@ bool GateSession(string &reason_id)
     return true;
 }
 
-// --- Gate 5: Over-extension ---
+// --- Gate 6: Over-extension ---
 bool GateOverExtension(string &reason_id)
 {
     static datetime last_overext_log_time = 0;
@@ -1749,7 +1899,7 @@ bool GateOverExtension(string &reason_id)
     return true;
 }
 
-// --- Gate 6: Volatility Regime ---
+// --- Gate 7: Volatility Regime ---
 bool GateVolatility(double &conf_io, string &reason_id)
 {
     if(!InpVR_Enable || InpVR_Mode == VR_OFF) return true;
@@ -1778,7 +1928,7 @@ bool GateVolatility(double &conf_io, string &reason_id)
     return true;
 }
 
-// --- Gate 7: Adaptive Spread (T028) ---
+// --- Gate 8: Adaptive Spread (T028) ---
 bool GateAdaptiveSpread(double &conf_io, string &reason_id)
 {
   g_as_exceeded_for_bar = false;
@@ -1814,7 +1964,7 @@ bool GateAdaptiveSpread(double &conf_io, string &reason_id)
 }
 
 
-// --- Gate 8: Structure Proximity (T027) ---
+// --- Gate 9: Structure Proximity (T027) ---
 bool GateStructureProximity(const int direction, double &conf_io, string &reason_id)
 {
   g_sp_hit_for_bar = false;
@@ -1892,7 +2042,7 @@ bool GateStructureProximity(const int direction, double &conf_io, string &reason
 }
 
 
-// --- Gate 9: ZoneEngine ---
+// --- Gate 10: ZoneEngine ---
 bool GateZE(const int direction, const double ze_strength, string &reason_id)
 {
     if(ZE_Gate == ZE_REQUIRED && ze_strength < ZE_MinStrength)
@@ -1904,7 +2054,7 @@ bool GateZE(const int direction, const double ze_strength, string &reason_id)
     return true;
 }
 
-// --- Gate 10: SMC ---
+// --- Gate 11: SMC ---
 bool GateSMC(const int direction, const int smc_sig, const double smc_conf, string &reason_id)
 {
     if(SMC_Mode == SMC_REQUIRED)
@@ -1919,7 +2069,7 @@ bool GateSMC(const int direction, const int smc_sig, const double smc_conf, stri
     return true;
 }
 
-// --- Gate 11: BiasCompass ---
+// --- Gate 12: BiasCompass ---
 bool GateBC(const int direction, const int bc_bias, string &reason_id)
 {
     if(BC_AlignMode == BC_REQUIRED)
@@ -1934,7 +2084,7 @@ bool GateBC(const int direction, const int bc_bias, string &reason_id)
     return true;
 }
 
-// --- Gate 12: Inter-Market Confirmation (T029) ---
+// --- Gate 13: Inter-Market Confirmation (T029) ---
 bool GateInterMarket(const int direction, double &conf_io, string &reason_id)
 {
   g_imc_flag_for_bar = false;
@@ -1962,7 +2112,7 @@ bool GateInterMarket(const int direction, double &conf_io, string &reason_id)
 }
 
 
-// --- Gate 13: Confidence ---
+// --- Gate 14: Confidence ---
 bool GateConfidence(const double conf_eff, string &reason_id)
 {
     if(conf_eff < MinConfidence)
@@ -1974,7 +2124,7 @@ bool GateConfidence(const double conf_eff, string &reason_id)
     return true;
 }
 
-// --- Gate 14: Cooldown ---
+// --- Gate 15: Cooldown ---
 bool GateCooldown(const int direction, string &reason_id)
 {
     int secs = PeriodSeconds((ENUM_TIMEFRAMES)SignalTimeframe);
@@ -1990,7 +2140,7 @@ bool GateCooldown(const int direction, string &reason_id)
     return true;
 }
 
-// --- Gate 15: Debounce ---
+// --- Gate 16: Debounce ---
 bool GateDebounce(const int direction, string &reason_id)
 {
     if(PerBarDebounce)
@@ -2008,7 +2158,7 @@ bool GateDebounce(const int direction, string &reason_id)
     return true;
 }
 
-// --- Gate 16: Position ---
+// --- Gate 17: Position ---
 bool GatePosition(string &reason_id)
 {
     if(PositionSelect(_Symbol))
@@ -2019,7 +2169,7 @@ bool GatePosition(string &reason_id)
     return true;
 }
 
-// --- Gate 17: Trigger ---
+// --- Gate 18: Trigger ---
 bool GateTrigger(const int direction, const int prev_sb_sig, string &reason_id)
 {
     bool is_edge = (direction != prev_sb_sig);
@@ -2060,6 +2210,7 @@ void EvaluateClosedBar()
     g_sp_hit_for_bar = false;
     g_as_exceeded_for_bar = false;
     g_imc_flag_for_bar = false;
+    g_rg_flag_for_bar = false;
     
     // --- Signal Gate: If no signal, we're done for this bar. ---
     if(direction == 0)
@@ -2073,6 +2224,7 @@ void EvaluateClosedBar()
     if(!GateWarmup(reason_id))                  { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
     if(!GateSpread(reason_id))                  { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
     if(!GateNews(conf_eff, reason_id))          { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
+    if(!GateRiskGuard(conf_eff, reason_id))     { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
     if(!GateSession(reason_id))                 { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
     if(!GateOverExtension(reason_id))           { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
     if(!GateVolatility(conf_eff, reason_id))    { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
@@ -2283,12 +2435,14 @@ bool TryOpenPosition(int signal, double conf_eff, int reason_code, double ze_str
    double sl_pts = MathAbs(entry-sl) / point;
    double tp_pts = (tp > 0) ? MathAbs(entry-tp) / point : -1.0;
    double rr_calc = (sl_pts > 0 && tp_pts > 0) ? (tp_pts / sl_pts) : -1.0;
+   
    DJ_Write(signal, conf_eff, reason_code, ze_strength, bc_bias, smc_sig, smc_conf, 
-            g_vr_flag_for_bar, g_news_flag_for_bar, g_sp_hit_for_bar ? 1 : 0, 
-            g_as_exceeded_for_bar ? 1 : 0, g_as_cap_pts_last, g_as_hist_count,
-            g_imc_flag_for_bar ? 1 : 0, g_imc_support,
-            (double)CurrentSpreadPoints(), 
-            lots_to_trade, sl_pts, tp_pts, rr_calc, entry_mode);
+        g_vr_flag_for_bar, g_news_flag_for_bar, g_sp_hit_for_bar ? 1 : 0, 
+        g_as_exceeded_for_bar ? 1 : 0, g_as_cap_pts_last, g_as_hist_count,
+        g_imc_flag_for_bar ? 1 : 0, g_imc_support,
+        (double)CurrentSpreadPoints(), 
+        lots_to_trade, sl_pts, tp_pts, rr_calc, entry_mode);
+
 
    string signal_str = (signal == 1) ? "BUY" : "SELL";
    string comment = StringFormat("AAI|%.1f|%d|%d|%.1f|%.5f|%.5f|%.1f",
@@ -2546,16 +2700,18 @@ void JournalClosedPosition(ulong position_id)
    for(int i=0; i < HistoryDealsTotal(); i++)
    {
       ulong deal_ticket = HistoryDealGetTicket(i);
-      if(HistoryDealGetInteger(deal_ticket, DEAL_ENTRY) == DEAL_ENTRY_IN)
+      if(HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID) == position_id)
       {
-         if(first_in_ticket == 0) first_in_ticket = deal_ticket;
+          if(HistoryDealGetInteger(deal_ticket, DEAL_ENTRY) == DEAL_ENTRY_IN)
+          {
+             if(first_in_ticket == 0) first_in_ticket = deal_ticket;
+          }
+          else
+          {
+             last_out_ticket = deal_ticket;
+          }
+          total_profit += HistoryDealGetDouble(deal_ticket, DEAL_PROFIT) + HistoryDealGetDouble(deal_ticket, DEAL_COMMISSION) + HistoryDealGetDouble(deal_ticket, DEAL_SWAP);
       }
-      else
-      {
-         last_out_ticket = deal_ticket;
-         // This will be the last one at the end of the loop
-      }
-      total_profit += HistoryDealGetDouble(deal_ticket, DEAL_PROFIT) + HistoryDealGetDouble(deal_ticket, DEAL_COMMISSION) + HistoryDealGetDouble(deal_ticket, DEAL_SWAP);
    }
 
    if(first_in_ticket == 0) return; // No opening deal found, cannot journal
