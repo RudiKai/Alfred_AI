@@ -48,14 +48,14 @@ int    AAI_dur_count   = 0;
 // ==================== /AAI METRICS ======================
 //+------------------------------------------------------------------+
 //| AAI_EA_Trade_Manager.mq5                                         |
-//|                    v4.8 - Structure Proximity Gate               |
+//|                    v4.9 - Adaptive Spread Gate                   |
 //|                                                                  |
 //| (Consumes all data from the refactored AAI_Indicator_SignalBrain)|
 //|                                                                  |
 //| Copyright 2025, AlfredAI Project                                 |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "4.8"
+#property version   "4.9"
 #property description "Manages trades based on signals from the central SignalBrain indicator."
 #include <Trade\Trade.mqh>
 #include <Arrays\ArrayLong.mqh>
@@ -316,14 +316,6 @@ input bool  HybridAlertPush        = true; // requires terminal Push enabled
 input bool  HybridAlertWriteIntent = true; // write intent file under g_dir_intent
 input int   HybridAlertThrottleSec = 60; // min seconds between alerts for the same bar
 #endif
-
-//--- Adaptive Spread Inputs (idempotent) ---
-#ifndef AAI_SPREAD_INPUTS_DEFINED
-#define AAI_SPREAD_INPUTS_DEFINED
-// Re-purposed MaxSpreadPoints from Trade Management as the hard cap
-input int SpreadMedianWindowTicks    = 120;
-input int SpreadHeadroomPoints       = 5; // allow median + headroom
-#endif
 ////////////// 
 #ifndef AAI_STR_TRIM_DEFINED
 #define AAI_STR_TRIM_DEFINED
@@ -396,6 +388,18 @@ input int    InpSP_SwingLookbackBars       = 50;
 input int    InpSP_SwingLeg                = 2;
 input int    InpSP_PrefPenalty             = 5;
 
+// --- Adaptive Spread (T028) ---
+input group "Adaptive Spread"
+enum ENUM_AS_Mode { AS_OFF=0, AS_REQUIRED=1, AS_PREFERRED=2 };
+input bool         InpAS_Enable             = true;
+input ENUM_AS_Mode InpAS_Mode               = AS_REQUIRED;
+input int          InpAS_SampleEveryNTicks  = 5;
+input int          InpAS_SamplesPerBarMax   = 400;
+input int          InpAS_WindowBars         = 20;
+input double       InpAS_SafetyPct          = 0.10;
+input int          InpAS_SafetyPts          = 2;
+input bool         InpAS_ClampToFixedMax    = true;
+input int          InpAS_PrefPenalty        = 2;
 
 //--- Confluence Module Inputs (M15 Baseline) ---
 input group "Confluence Modules"
@@ -455,6 +459,17 @@ static int  g_vr_flag_for_bar   = 0;
 static int  g_news_flag_for_bar = 0;
 static bool g_sp_hit_for_bar    = false;
 
+// --- T028: Adaptive Spread State ---
+int      g_as_tick_ctr            = 0;
+double   g_as_samples[];
+datetime g_as_forming_bar_time    = 0;
+double   g_as_bar_medians[];
+int      g_as_hist_count          = 0;
+int      g_as_hist_pos            = 0;
+bool     g_as_exceeded_for_bar    = false;
+double   g_as_cap_pts_last        = 0.0;
+
+
 // --- T012: Summary Counters ---
 static long g_entries      = 0;
 static long g_wins         = 0;
@@ -463,6 +478,7 @@ static long g_blk_ze       = 0;
 static long g_blk_bc       = 0;
 static long g_blk_over     = 0;
 static long g_blk_spread   = 0;
+static long g_blk_aspread  = 0; // T028
 static long g_blk_smc      = 0;
 static long g_blk_vr       = 0; 
 static long g_blk_news     = 0;
@@ -475,6 +491,7 @@ datetime g_stamp_bc    = 0;
 datetime g_stamp_over  = 0;
 datetime g_stamp_sess  = 0;
 datetime g_stamp_spd   = 0;
+datetime g_stamp_aspd  = 0; // T028
 datetime g_stamp_atr   = 0;
 datetime g_stamp_cool  = 0;
 datetime g_stamp_bar   = 0;
@@ -500,7 +517,7 @@ datetime g_stamp_hyb = 0;     // once-per-bar stamp
 void PrintSummary()
 {
     if(g_summary_printed) return;
-    PrintFormat("AAI_SUMMARY|entries=%d|wins=%d|losses=%d|ze_blk=%d|bc_blk=%d|smc_blk=%d|overext_blk=%d|spread_blk=%d|vr_blk=%d|news_blk=%d|sp_blk=%d",
+    PrintFormat("AAI_SUMMARY|entries=%d|wins=%d|losses=%d|ze_blk=%d|bc_blk=%d|smc_blk=%d|overext_blk=%d|spread_blk=%d|aspread_blk=%d|vr_blk=%d|news_blk=%d|sp_blk=%d",
                 g_entries,
                 g_wins,
                 g_losses,
@@ -509,6 +526,7 @@ void PrintSummary()
                 g_blk_smc,
                 g_blk_over,
                 g_blk_spread,
+                g_blk_aspread,
                 g_blk_vr,
                 g_blk_news,
                 g_blk_sp);
@@ -739,7 +757,10 @@ void DJ_Write(const int direction,
               const double smc_conf,
               const int vr_flag,
               const int news_flag,
-              const int sp_flag, // T027
+              const int sp_flag, 
+              const int as_flag,
+              const double as_cap_pts,
+              const int as_hist_n,
               const double spread_pts,
               const double lots,
               const double sl_pts,
@@ -756,7 +777,7 @@ void DJ_Write(const int direction,
   // Write header if file is empty or we’re not appending
   if(FileSize(h) == 0 || !InpDJ_Append){
     FileSeek(h, 0, SEEK_SET);
-    string header = "time,symbol,tf,dir,conf,sb_reason,ze_strength,bc_bias,smc_sig,smc_conf,vr_flag,news_flag,sp_flag,spread_pts,lots,sl_pts,tp_pts,rr,entry_mode\r\n";
+    string header = "time,symbol,tf,dir,conf,sb_reason,ze_strength,bc_bias,smc_sig,smc_conf,vr_flag,news_flag,sp_flag,as_flag,as_cap_pts,as_histN,spread_pts,lots,sl_pts,tp_pts,rr,entry_mode\r\n";
     FileWriteString(h, header);
   }
 
@@ -766,7 +787,7 @@ void DJ_Write(const int direction,
   datetime t = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1); // closed bar time
   string tf  = TfLabel((ENUM_TIMEFRAMES)SignalTimeframe);
 
-  string row = StringFormat("%s,%s,%s,%d,%.0f,%d,%.1f,%d,%d,%.1f,%d,%d,%d,%.0f,%.2f,%.0f,%.0f,%.2f,%s\r\n",
+  string row = StringFormat("%s,%s,%s,%d,%.0f,%d,%.1f,%d,%d,%.1f,%d,%d,%d,%d,%.0f,%d,%.0f,%.2f,%.0f,%.0f,%.2f,%s\r\n",
     TimeToString(t, TIME_DATE|TIME_SECONDS),
     _Symbol,
     tf,
@@ -780,6 +801,9 @@ void DJ_Write(const int direction,
     vr_flag,
     news_flag,
     sp_flag,
+    as_flag,
+    as_cap_pts,
+    as_hist_n,
     spread_pts,
     lots,
     sl_pts,
@@ -974,6 +998,7 @@ int OnInit()
    g_blk_smc = 0;
    g_blk_over = 0;
    g_blk_spread = 0;
+   g_blk_aspread = 0;
    g_blk_news = 0;
    g_blk_vr = 0;
    g_blk_sp = 0;
@@ -990,6 +1015,12 @@ g_last_entry_bar_sell = 0;
 g_cool_until_buy  = 0;
 g_cool_until_sell = 0;
 
+// --- T028: Init Adaptive Spread state ---
+ArrayResize(g_as_bar_medians, MathMax(1, InpAS_WindowBars));
+g_as_hist_count = 0; g_as_hist_pos = 0;
+ArrayResize(g_as_samples, 0);
+g_as_tick_ctr = 0;
+g_as_forming_bar_time = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 0);
 
 // --- TICKET #2: Create the single, centralized SignalBrain handle ---
 sb_handle = iCustom(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, AAI_Ind("AAI_Indicator_SignalBrain"),
@@ -1340,10 +1371,58 @@ if(trans.type == TRADE_TRANSACTION_DEAL_ADD && HistoryDealSelect(trans.deal))
 }
 
 //+------------------------------------------------------------------+
+//| >>> T028: Adaptive Spread Tick Sampler <<<                       |
+//+------------------------------------------------------------------+
+void AS_OnTickSample()
+{
+  if(!InpAS_Enable || InpAS_Mode==AS_OFF) return;
+
+  // Detect bar change on the forming bar (shift=0)
+  datetime forming = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 0);
+  if(g_as_forming_bar_time == 0) g_as_forming_bar_time = forming;
+
+  if(forming != g_as_forming_bar_time){
+    // The previous forming bar just closed → finalize its spread median
+    if(ArraySize(g_as_samples) > 0){
+      // Make a copy and sort to compute median
+      double tmp[]; ArrayCopy(tmp, g_as_samples);
+      ArraySort(tmp);
+      const int n = ArraySize(tmp);
+      double bar_median = (n%2 != 0 ? tmp[n/2] : 0.5*(tmp[n/2-1] + tmp[n/2]));
+
+      // Push into ring buffer
+      if(g_as_hist_count < ArraySize(g_as_bar_medians)) g_as_hist_count++;
+      g_as_bar_medians[g_as_hist_pos] = bar_median;
+      g_as_hist_pos = (g_as_hist_pos + 1) % ArraySize(g_as_bar_medians);
+    }
+    // Reset for new forming bar
+    ArrayResize(g_as_samples, 0);
+    g_as_tick_ctr = 0;
+    g_as_forming_bar_time = forming;
+  }
+
+  // Sample this tick
+  g_as_tick_ctr++;
+  if(g_as_tick_ctr % MathMax(1, InpAS_SampleEveryNTicks) != 0) return;
+  if(ArraySize(g_as_samples) >= InpAS_SamplesPerBarMax) return;
+
+  // Use current spread in POINTS (reuse your helper if you have one)
+  long spr = 0;
+  if(SymbolInfoInteger(_Symbol, SYMBOL_SPREAD, spr)){
+    // SYMBOL_SPREAD is in points; store as double
+    const double spr_pts = (double)spr;
+    int sz = ArraySize(g_as_samples);
+    ArrayResize(g_as_samples, sz+1);
+    g_as_samples[sz] = spr_pts;
+  }
+}
+
+//+------------------------------------------------------------------+
 //| OnTick: Event-driven logic                                       |
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   AS_OnTickSample(); // T028: Sample spread on every tick
    g_tickCount++;
    
    if(PositionSelect(_Symbol))
@@ -1404,6 +1483,25 @@ double FindRecentSwingLow(const int lookback, const int L)
   return 0.0;
 }
 
+//+------------------------------------------------------------------+
+//| >>> T028 Adaptive Spread Helpers <<<                             |
+//+------------------------------------------------------------------+
+// Median of last 'count' elements from ring buffer
+double AS_MedianOfHistory()
+{
+  const int N = g_as_hist_count;
+  if(N <= 0) return 0.0;
+
+  // Unroll ring into a linear temp
+  double tmp[]; ArrayResize(tmp, N);
+  int idx = (g_as_hist_pos - N + ArraySize(g_as_bar_medians)) % ArraySize(g_as_bar_medians);
+  for(int i=0;i<N;i++){
+    tmp[i] = g_as_bar_medians[(idx + i) % ArraySize(g_as_bar_medians)];
+  }
+  ArraySort(tmp);
+  return (N%2!=0 ? tmp[N/2] : 0.5*(tmp[N/2-1] + tmp[N/2]));
+}
+
 
 //+------------------------------------------------------------------+
 //| >>> T025 GATE REFACTOR: Gate Functions <<<                       |
@@ -1428,7 +1526,7 @@ bool GateWarmup(string &reason_id)
     return true;
 }
 
-// --- Gate 2: Spread ---
+// --- Gate 2: Fixed Spread ---
 bool GateSpread(string &reason_id)
 {
     int currentSpread = CurrentSpreadPoints();
@@ -1587,7 +1685,43 @@ bool GateVolatility(double &conf_io, string &reason_id)
     return true;
 }
 
-// --- Gate 7: Structure Proximity (T027) ---
+// --- Gate 7: Adaptive Spread (T028) ---
+bool GateAdaptiveSpread(double &conf_io, string &reason_id)
+{
+  g_as_exceeded_for_bar = false;
+  g_as_cap_pts_last = 0.0;
+
+  if(!InpAS_Enable || InpAS_Mode==AS_OFF) return true;
+  if(g_as_hist_count == 0) return true; // no history yet → permissive
+
+  // Build adaptive cap
+  double med = AS_MedianOfHistory();         // points
+  double cap = med * (1.0 + MathMax(0.0, InpAS_SafetyPct)) + (double)MathMax(0, InpAS_SafetyPts);
+
+  if(InpAS_ClampToFixedMax){
+    cap = (MaxSpreadPoints > 0 ? MathMin(cap, (double)MaxSpreadPoints) : cap);
+  }
+
+  g_as_cap_pts_last = cap;
+
+  double spread_pts = (double)CurrentSpreadPoints();
+
+  if(spread_pts > cap){
+    g_as_exceeded_for_bar = true;
+    if(InpAS_Mode == AS_REQUIRED){
+      reason_id = "aspread";
+      if(g_stamp_aspd != g_sb.closed_bar_time) { g_blk_aspread++; g_stamp_aspd = g_sb.closed_bar_time; }
+      return false;
+    }else{ // PREFERRED
+      conf_io = MathMax(0.0, conf_io - (double)InpAS_PrefPenalty);
+      return true;
+    }
+  }
+  return true;
+}
+
+
+// --- Gate 8: Structure Proximity (T027) ---
 bool GateStructureProximity(const int direction, double &conf_io, string &reason_id)
 {
   g_sp_hit_for_bar = false;
@@ -1665,7 +1799,7 @@ bool GateStructureProximity(const int direction, double &conf_io, string &reason
 }
 
 
-// --- Gate 8: ZoneEngine ---
+// --- Gate 9: ZoneEngine ---
 bool GateZE(const int direction, const double ze_strength, string &reason_id)
 {
     if(ZE_Gate == ZE_REQUIRED && ze_strength < ZE_MinStrength)
@@ -1677,7 +1811,7 @@ bool GateZE(const int direction, const double ze_strength, string &reason_id)
     return true;
 }
 
-// --- Gate 9: SMC ---
+// --- Gate 10: SMC ---
 bool GateSMC(const int direction, const int smc_sig, const double smc_conf, string &reason_id)
 {
     if(SMC_Mode == SMC_REQUIRED)
@@ -1692,7 +1826,7 @@ bool GateSMC(const int direction, const int smc_sig, const double smc_conf, stri
     return true;
 }
 
-// --- Gate 10: BiasCompass ---
+// --- Gate 11: BiasCompass ---
 bool GateBC(const int direction, const int bc_bias, string &reason_id)
 {
     if(BC_AlignMode == BC_REQUIRED)
@@ -1707,7 +1841,7 @@ bool GateBC(const int direction, const int bc_bias, string &reason_id)
     return true;
 }
 
-// --- Gate 11: Confidence ---
+// --- Gate 12: Confidence ---
 bool GateConfidence(const double conf_eff, string &reason_id)
 {
     if(conf_eff < MinConfidence)
@@ -1719,7 +1853,7 @@ bool GateConfidence(const double conf_eff, string &reason_id)
     return true;
 }
 
-// --- Gate 12: Cooldown ---
+// --- Gate 13: Cooldown ---
 bool GateCooldown(const int direction, string &reason_id)
 {
     int secs = PeriodSeconds((ENUM_TIMEFRAMES)SignalTimeframe);
@@ -1735,7 +1869,7 @@ bool GateCooldown(const int direction, string &reason_id)
     return true;
 }
 
-// --- Gate 13: Debounce ---
+// --- Gate 14: Debounce ---
 bool GateDebounce(const int direction, string &reason_id)
 {
     if(PerBarDebounce)
@@ -1753,7 +1887,7 @@ bool GateDebounce(const int direction, string &reason_id)
     return true;
 }
 
-// --- Gate 14: Position ---
+// --- Gate 15: Position ---
 bool GatePosition(string &reason_id)
 {
     if(PositionSelect(_Symbol))
@@ -1764,7 +1898,7 @@ bool GatePosition(string &reason_id)
     return true;
 }
 
-// --- Gate 15: Trigger ---
+// --- Gate 16: Trigger ---
 bool GateTrigger(const int direction, const int prev_sb_sig, string &reason_id)
 {
     bool is_edge = (direction != prev_sb_sig);
@@ -1799,10 +1933,11 @@ void EvaluateClosedBar()
     LogPerBarStatus(direction, conf_eff, reason_sb, ze_strength, bc_bias);
     UpdateHUD(direction, conf_eff, reason_sb, ze_strength, bc_bias);
     
-    // --- T026/T027: Reset per-bar flags ---
+    // --- Reset per-bar flags ---
     g_vr_flag_for_bar = 0;
     g_news_flag_for_bar = 0;
     g_sp_hit_for_bar = false;
+    g_as_exceeded_for_bar = false;
     
     // --- Signal Gate: If no signal, we're done for this bar. ---
     if(direction == 0)
@@ -1819,6 +1954,7 @@ void EvaluateClosedBar()
     if(!GateSession(reason_id))                 { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
     if(!GateOverExtension(reason_id))           { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
     if(!GateVolatility(conf_eff, reason_id))    { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
+    if(!GateAdaptiveSpread(conf_eff, reason_id)){ PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
     if(!GateStructureProximity(direction, conf_eff, reason_id)) { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
     if(!GateZE(direction, ze_strength, reason_id)) { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
     if(!GateSMC(direction, smc_sig, smc_conf, reason_id)) { PrintFormat("%s reason=%s", AAI_BLOCK_LOG, reason_id); return; }
@@ -2026,6 +2162,7 @@ bool TryOpenPosition(int signal, double conf_eff, int reason_code, double ze_str
    double rr_calc = (sl_pts > 0 && tp_pts > 0) ? (tp_pts / sl_pts) : -1.0;
    DJ_Write(signal, conf_eff, reason_code, ze_strength, bc_bias, smc_sig, smc_conf, 
             g_vr_flag_for_bar, g_news_flag_for_bar, g_sp_hit_for_bar ? 1 : 0, 
+            g_as_exceeded_for_bar ? 1 : 0, g_as_cap_pts_last, g_as_hist_count,
             (double)CurrentSpreadPoints(), 
             lots_to_trade, sl_pts, tp_pts, rr_calc, entry_mode);
 
