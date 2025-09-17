@@ -48,14 +48,14 @@ int    AAI_dur_count   = 0;
 // ==================== /AAI METRICS ======================
 //+------------------------------------------------------------------+
 //| AAI_EA_Trade_Manager.mq5                                         |
-//|                    v5.5 - Post-Fill Harmonizer                   |
+//|                    v5.6 - Trailing/BE Framework                  |
 //|                                                                  |
 //| (Consumes all data from the refactored AAI_Indicator_SignalBrain)|
 //|                                                                  |
 //| Copyright 2025, AlfredAI Project                                 |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "5.5"
+#property version   "5.6"
 #property description "Manages trades based on signals from the central SignalBrain indicator."
 #include <Trade\Trade.mqh>
 #include <Arrays\ArrayObj.mqh>
@@ -236,6 +236,8 @@ enum ENUM_SLTA_Mode {
 };
 // T034: Post-Fill Harmonizer Mode
 enum ENUM_HM_Mode { HM_OFF=0, HM_ONESHOT_IMMEDIATE=1, HM_DELAYED_RETRY=2 };
+// T035: Trailing/BE Mode
+enum ENUM_TRL_Mode { TRL_OFF=0, TRL_BE_ONLY=1, TRL_ATR=2, TRL_CHANDELIER=3, TRL_SWING=4 };
 
 
 //--- EA Inputs
@@ -365,8 +367,28 @@ input double   Fixed_RR            = 1.6;
 input double   Partial_Pct         = 50.0;
 input double   Partial_R_multiple  = 1.0;
 input int      BE_Offset_Points    = 1;
-input int      Trail_Start_Pips    = 22;
-input int      Trail_Stop_Pips     = 10;
+
+// --- Trailing / Break-Even (T035) ---
+input group "Trailing / Break-Even"
+input bool          InpTRL_Enable            = true;
+input ENUM_TRL_Mode InpTRL_Mode              = TRL_ATR;
+input bool          InpTRL_OnBarClose        = true;
+input int           InpTRL_MinSecondsBetween = 15;
+input bool          InpTRL_BE_Enable         = true;
+input double        InpTRL_BE_TriggerRR      = 1.0;
+input int           InpTRL_BE_TriggerPts     = 0;
+input int           InpTRL_BE_OffsetPts      = 2;
+input ENUM_TIMEFRAMES InpTRL_ATR_Timeframe   = PERIOD_CURRENT;
+input int           InpTRL_ATR_Period        = 14;
+input double        InpTRL_ATR_Mult          = 2.0;
+input int           InpTRL_AtrLookbackBars   = 22;
+input int           InpTRL_SwingLookbackBars = 50;
+input int           InpTRL_SwingLeg          = 2;
+input int           InpTRL_SwingBufferPts    = 5;
+input int           InpTRL_MinBumpPts        = 2;
+input int           InpTRL_MaxDailyMoves     = 10;
+input bool          InpTRL_LogVerbose        = false;
+
 //--- Entry Filter Inputs (M15 Baseline) ---
 input group "Entry Filters"
 input int        MinConfidence        = 50;
@@ -549,6 +571,7 @@ int g_hATR = INVALID_HANDLE;
 int g_hOverextMA = INVALID_HANDLE;
 int g_hATR_VR = INVALID_HANDLE; // T022: New handle for Volatility Regime
 int g_hATR_SP = INVALID_HANDLE; // T027: New handle for Structure Proximity
+int g_hATR_TRL = INVALID_HANDLE; // T035
 
 // --- State Management Globals ---
 static datetime g_lastBarTime = 0;
@@ -604,6 +627,22 @@ public:
 };
 CArrayObj g_hm_tasks;
 datetime  g_hm_last_tick_ts = 0;
+
+// --- T035: Trailing State ---
+class TRL_State : public CObject {
+public:
+  string   symbol;
+  int      direction;
+  double   entry_price;
+  double   entry_sl_pts;
+  bool     be_done;
+  int      moves_today;
+  datetime last_mod_time;
+  datetime day_anchor;
+  TRL_State(): direction(0), entry_price(0), entry_sl_pts(0), be_done(false),
+               moves_today(0), last_mod_time(0), day_anchor(0) {}
+};
+CArrayObj g_trl_states;
 
 
 // --- T012: Summary Counters ---
@@ -1332,6 +1371,7 @@ bool OSR_IsRetryable(const uint retcode)
   return false;
 }
 
+
 //+------------------------------------------------------------------+
 //| >>> T031: Core OSR Sender <<<                                    |
 //+------------------------------------------------------------------+
@@ -1688,6 +1728,9 @@ g_rg_consec_losses = 0; // Full reset on init
 // --- T034: Init Harmonizer state ---
 g_hm_tasks.Clear();
 
+// --- T035: Init Trailing State ---
+g_trl_states.Clear();
+
 // --- TICKET #2: Create the single, centralized SignalBrain handle ---
 sb_handle = iCustom(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, AAI_Ind("AAI_Indicator_SignalBrain"),
                     // Core SB Settings
@@ -1727,6 +1770,13 @@ if(sb_handle == INVALID_HANDLE)
    {
       g_hATR_SP = iATR(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, InpSP_ATR_Period);
       if(g_hATR_SP == INVALID_HANDLE) { PrintFormat("%s Failed to create Structure Proximity ATR handle", INIT_ERROR); return(INIT_FAILED); }
+   }
+   
+   // --- T035: Initialize Trailing ATR Handle ---
+   if((InpTRL_Mode == TRL_ATR || InpTRL_Mode == TRL_CHANDELIER) && InpTRL_ATR_Timeframe == PERIOD_CURRENT)
+   {
+      g_hATR_TRL = iATR(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, InpTRL_ATR_Period);
+      if(g_hATR_TRL == INVALID_HANDLE) { PrintFormat("%s Failed to create Trailing ATR handle", INIT_ERROR); return(INIT_FAILED); }
    }
 
    if(Hybrid_RequireApproval)
@@ -1771,7 +1821,12 @@ void OnTesterDeinit() { PrintSummary(); }
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   g_hm_tasks.Clear();
+for(int i = g_hm_tasks.Total()-1; i >= 0; --i){ delete (HM_Task*)g_hm_tasks.At(i); }
+g_hm_tasks.Clear();
+
+for(int i = g_trl_states.Total()-1; i >= 0; --i){ delete (TRL_State*)g_trl_states.At(i); }
+g_trl_states.Clear();
+
    
    // --- AAI END-OF-TEST SUMMARY (Journal) ---
    double PF = (AAI_gross_loss > 0.0 ? (AAI_gross_profit / AAI_gross_loss) : (AAI_gross_profit > 0.0 ? DBL_MAX : 0.0));
@@ -1795,7 +1850,8 @@ void OnDeinit(const int reason)
    if(g_hATR != INVALID_HANDLE) IndicatorRelease(g_hATR);
    if(g_hOverextMA != INVALID_HANDLE) IndicatorRelease(g_hOverextMA);
    if(g_hATR_VR != INVALID_HANDLE) IndicatorRelease(g_hATR_VR); 
-   if(g_hATR_SP != INVALID_HANDLE) IndicatorRelease(g_hATR_SP); // T027
+   if(g_hATR_SP != INVALID_HANDLE) IndicatorRelease(g_hATR_SP);
+   if(g_hATR_TRL != INVALID_HANDLE) IndicatorRelease(g_hATR_TRL);
 
    // --- T006: Clean up HUD Object ---
    ObjectDelete(0, HUD_OBJECT_NAME);
@@ -1955,6 +2011,16 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
                g_rg_day_sl_hits++;
             }
          }
+         // T035: Delete Trailing State on close
+         for(int i = g_trl_states.Total() - 1; i >= 0; i--)
+         {
+            TRL_State *s = (TRL_State*)g_trl_states.At(i);
+            if(s && s.symbol == HistoryDealGetString(trans.deal, DEAL_SYMBOL))
+            {
+               g_trl_states.Delete(i);
+               delete s;
+            }
+         }
       }
 
       // EXEC on entry (print once)
@@ -2112,6 +2178,7 @@ void OnTick()
 {
    AS_OnTickSample();   // T028 sampler
    HM_OnTick();         // T034 harmonizer worker
+   TRL_OnTick();        // T035 trailing worker
    g_tickCount++;
    
    if(PositionSelect(_Symbol))
@@ -2247,6 +2314,160 @@ double IMC_WeightedSupport(const int our_direction)
 
   if(wsum <= 0.0) return 1.0; // no active confirmers → fully permissive
   return accum / wsum;
+}
+
+
+//+------------------------------------------------------------------+
+//| >>> T035: Trailing/BE Helpers <<<                                |
+//+------------------------------------------------------------------+
+TRL_State* TRL_GetState(const string sym, const bool create_if_missing = false)
+{
+  for(int i=0;i<g_trl_states.Total();++i){
+    TRL_State *s = (TRL_State*)g_trl_states.At(i);
+    if(s && s.symbol==sym) return s;
+  }
+  if(!create_if_missing) return NULL;
+  TRL_State *ns = new TRL_State; ns.symbol = sym; g_trl_states.Add(ns); return ns;
+}
+
+void TRL_MaybeRollover(TRL_State &st)
+{
+  datetime now = TimeCurrent();
+  if(st.day_anchor==0 || (now - st.day_anchor) >= 24*3600){
+    st.day_anchor = now;
+    st.moves_today = 0;
+  }
+}
+
+double TRL_TightenSL(const int dir, const double cur_sl, const double candidate)
+{
+  if(candidate<=0.0) return 0.0;
+  if(cur_sl<=0.0) return candidate;
+  if(dir>0 && candidate > cur_sl + InpTRL_MinBumpPts*_Point) return candidate;
+  if(dir<0 && candidate < cur_sl - InpTRL_MinBumpPts*_Point) return candidate;
+  return 0.0;
+}
+
+bool TRL_GetATR(const string sym, const ENUM_TIMEFRAMES tf, const int period, double &atr_out)
+{
+  atr_out = 0.0;
+  int handle = (tf==PERIOD_CURRENT) ? g_hATR_TRL : iATR(sym, tf, period);
+  if(handle == INVALID_HANDLE) return false;
+  
+  double a[1];
+  if(CopyBuffer(handle, 0, (InpTRL_OnBarClose?1:0), 1, a) != 1) return false;
+  atr_out = a[0];
+  
+  if(tf != PERIOD_CURRENT) IndicatorRelease(handle);
+  return (atr_out>0.0);
+}
+
+bool TRL_HHLL(const string sym, const ENUM_TIMEFRAMES tf, const int lookback, double &hh, double &ll)
+{
+  hh=0.0; ll=0.0;
+  double H[], L[]; ArraySetAsSeries(H,true); ArraySetAsSeries(L,true);
+  if(CopyHigh(sym, tf, (InpTRL_OnBarClose?1:0), lookback, H) != lookback) return false;
+  if(CopyLow (sym, tf, (InpTRL_OnBarClose?1:0), lookback, L) != lookback) return false;
+
+  int ih = ArrayMaximum(H, 0, WHOLE_ARRAY);
+  int il = ArrayMinimum(L, 0, WHOLE_ARRAY);
+  if(ih<0 || il<0) return false;
+  hh = H[ih];
+  ll = L[il];
+  return true;
+}
+
+//+------------------------------------------------------------------+
+//| >>> T035: Trailing/BE Worker <<<                                 |
+//+------------------------------------------------------------------+
+void TRL_OnTick()
+{
+  if(!InpTRL_Enable || InpTRL_Mode==TRL_OFF) return;
+  if(!PositionSelect(_Symbol)) return;
+
+  int    dir  = (int)PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY ? +1 : -1;
+  double cur_sl= PositionGetDouble(POSITION_SL);
+  double cur_tp= PositionGetDouble(POSITION_TP);
+  double px_op = PositionGetDouble(POSITION_PRICE_OPEN);
+  double px_c  = (InpTRL_OnBarClose ? iClose(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1)
+                                    : (dir>0 ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                                             : SymbolInfoDouble(_Symbol, SYMBOL_ASK)));
+
+  TRL_State *st = TRL_GetState(_Symbol, true);
+  st.direction   = dir;
+  if(st.entry_price <= 0.0) st.entry_price = px_op;
+  if(st.entry_sl_pts <= 0.0 && cur_sl>0.0) st.entry_sl_pts = MathAbs(px_op - cur_sl)/_Point;
+
+  TRL_MaybeRollover(*st);
+  if(InpTRL_MinSecondsBetween > 0 && (TimeCurrent() - st.last_mod_time) < InpTRL_MinSecondsBetween) return;
+  if(InpTRL_MaxDailyMoves > 0 && st.moves_today >= InpTRL_MaxDailyMoves) return;
+
+  // --- 1) Break-even?
+  if(InpTRL_BE_Enable && !st.be_done){
+    bool trigger = false;
+    if(InpTRL_BE_TriggerRR > 0.0 && st.entry_sl_pts > 0.0){
+      double rr = MathAbs(px_c - st.entry_price)/_Point / st.entry_sl_pts;
+      if(rr >= InpTRL_BE_TriggerRR) trigger = true;
+    }
+    if(!trigger && InpTRL_BE_TriggerPts > 0){
+      double prof_pts = (dir>0 ? (px_c - st.entry_price) : (st.entry_price - px_c))/_Point;
+      if(prof_pts >= InpTRL_BE_TriggerPts) trigger = true;
+    }
+
+    if(trigger){
+      double be_px = st.entry_price + (dir>0 ? +InpTRL_BE_OffsetPts*_Point : -InpTRL_BE_OffsetPts*_Point);
+      double cand  = TRL_TightenSL(dir, cur_sl, be_px);
+      if(cand > 0.0){
+        HM_Enqueue(_Symbol, (long)PositionGetInteger(POSITION_TICKET), cand, cur_tp);
+        st.be_done = true;
+        st.last_mod_time = TimeCurrent();
+        st.moves_today++;
+        if(InpTRL_LogVerbose) Print("[TRL] BE move enqueued.");
+        return;
+      }else{
+        st.be_done = true;
+      }
+    }
+  }
+
+  if(InpTRL_Mode==TRL_BE_ONLY) return;
+
+  // --- 2) Trailing mode
+  double target_sl = 0.0;
+
+  if(InpTRL_Mode==TRL_ATR || InpTRL_Mode==TRL_CHANDELIER)
+  {
+    double atr;
+    ENUM_TIMEFRAMES tf = (InpTRL_ATR_Timeframe==PERIOD_CURRENT ? (ENUM_TIMEFRAMES)SignalTimeframe : InpTRL_ATR_Timeframe);
+    if(!TRL_GetATR(_Symbol, tf, InpTRL_ATR_Period, atr)) return;
+
+    if(InpTRL_Mode==TRL_ATR){
+      double off = InpTRL_ATR_Mult * atr;
+      target_sl = (dir>0 ? px_c - off : px_c + off);
+    }else{ // CHANDELIER
+      double hh, ll;
+      if(!TRL_HHLL(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, InpTRL_AtrLookbackBars, hh, ll)) return;
+      double off = InpTRL_ATR_Mult * atr;
+      target_sl  = (dir>0 ? hh - off : ll + off);
+    }
+  }
+  else if(InpTRL_Mode==TRL_SWING)
+  {
+    double sw_hi = FindRecentSwingHigh(InpTRL_SwingLookbackBars, InpTRL_SwingLeg);
+    double sw_lo = FindRecentSwingLow(InpTRL_SwingLookbackBars, InpTRL_SwingLeg);
+    if(dir>0 && sw_lo>0) target_sl = sw_lo - InpTRL_SwingBufferPts*_Point;
+    if(dir<0 && sw_hi>0) target_sl = sw_hi + InpTRL_SwingBufferPts*_Point;
+  }
+
+  if(target_sl <= 0.0) return;
+
+  double cand = TRL_TightenSL(dir, cur_sl, target_sl);
+  if(cand <= 0.0) return;
+
+  HM_Enqueue(_Symbol, (long)PositionGetInteger(POSITION_TICKET), cand, cur_tp);
+  st.last_mod_time = TimeCurrent();
+  st.moves_today++;
+  if(InpTRL_LogVerbose) PrintFormat("[TRL] Trail enqueued: SL->%.5f", cand);
 }
 
 
@@ -2958,7 +3179,24 @@ bool TryOpenPosition(int signal, double conf_eff, int reason_code, double ze_str
    }
    
    // --- Post-open bookkeeping ---
-   if(tRes.deal > 0) HM_Enqueue(_Symbol, (long)PositionGetInteger(POSITION_TICKET), slPrice, tpPrice);
+   if(tRes.deal > 0) {
+      long pos_ticket = (long)PositionGetInteger(POSITION_TICKET);
+      if(pos_ticket > 0)
+      {
+         HM_Enqueue(_Symbol, pos_ticket, slPrice, tpPrice);
+         
+         // T035: Create Trailing State
+         TRL_State *st = TRL_GetState(_Symbol, true);
+         st.direction = signal;
+         st.entry_price = PositionGetDouble(POSITION_PRICE_OPEN);
+         st.entry_sl_pts = MathAbs(st.entry_price - slPrice) / _Point;
+         st.be_done = false;
+         st.moves_today = 0;
+         st.last_mod_time = 0;
+         // Reuse risk guard day anchor
+         st.day_anchor = g_rg_day_anchor_time;
+      }
+   }
 
    g_entries++;
    PrintFormat("%s Signal:%s → Executed %.2f lots @%.5f | SL:%.5f TP:%.5f",
@@ -3040,15 +3278,11 @@ bool AAI_ApplyBEAndTrail(const ENUM_POSITION_TYPE side, const double entry_price
       }
    }
 
-   if(Trail_Start_Pips > 0 && move_pips >= Trail_Start_Pips && Trail_Stop_Pips > 0)
+   if(InpTRL_Enable && InpTRL_Mode != TRL_OFF) // Defer trailing to TRL_OnTick
    {
-      double trail_target = px - (is_long ? Trail_Stop_Pips : -Trail_Stop_Pips) * pip;
-      if( (is_long && (trail_target > sl_io)) || (!is_long && (trail_target < sl_io)) )
-      {
-         sl_io = trail_target;
-         changed = true;
-      }
+      // old trailing logic is now handled by TRL_OnTick
    }
+
    return changed;
 }
 
