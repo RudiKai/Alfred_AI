@@ -48,14 +48,14 @@ int    AAI_dur_count   = 0;
 // ==================== /AAI METRICS ======================
 //+------------------------------------------------------------------+
 //| AAI_EA_Trade_Manager.mq5                                         |
-//|           v4.1 - Timing Bug Fixes                                |
+//|           v4.4 - SB Confluence Model Control                     |
 //|                                                                  |
 //| (Consumes all data from the refactored AAI_Indicator_SignalBrain)|
 //|                                                                  |
 //| Copyright 2025, AlfredAI Project                                 |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "4.1"
+#property version   "4.4"
 #property description "Manages trades based on signals from the central SignalBrain indicator."
 #include <Trade\Trade.mqh>
 #include <Arrays\ArrayLong.mqh>
@@ -108,6 +108,19 @@ inline string AAI_Ind(const string name)
    return AAI_IND_PREFIX + name;
 }
 
+// --- TICKET T021: Bar-Change Cache ---
+struct SBReadCache {
+  datetime closed_bar_time;
+  int      sig;       // SB_BUF_SIGNAL
+  double   conf;      // SB_BUF_CONF
+  int      reason;    // SB_BUF_REASON
+  double   ze;        // SB_BUF_ZE
+  int      smc_sig;   // SB_BUF_SMC_SIG
+  double   smc_conf;  // SB_BUF_SMC_CONF
+  int      bc;        // SB_BUF_BC
+  bool     valid;
+};
+static SBReadCache g_sb;
 
 
 // --- T006: HUD Object Name ---
@@ -219,7 +232,18 @@ input ENUM_TIMEFRAMES SignalTimeframe = PERIOD_CURRENT;
 input int SB_ReadShift = 1;
 input int WarmupBars = 200;
 
-// TICKET #2 --- All Pass-Through Inputs for the new SignalBrain ---
+// --- TICKET T023: Inputs to control SignalBrain's confluence model ---
+input group "--- SignalBrain Confluence Model ---";
+enum ENUM_SB_ConfModel { SB_CONF_ADDITIVE=0, SB_CONF_GEOMETRIC=1 };
+input ENUM_SB_ConfModel InpSB_ConfModel = SB_CONF_ADDITIVE;
+input double InpSB_W_BASE = 1.0;
+input double InpSB_W_BC   = 1.0;
+input double InpSB_W_ZE   = 1.0;
+input double InpSB_W_SMC  = 1.0;
+input double InpSB_ConflictPenalty = 0.80;
+
+
+// --- All Pass-Through Inputs for the new SignalBrain ---
 input group "--- SignalBrain Pass-Through Inputs ---";
 // Core SB Settings
 input bool   SB_SafeTest        = false;
@@ -231,10 +255,11 @@ input int    SB_FastMA          = 10;
 input int    SB_SlowMA          = 30;
 input int    SB_MinZoneStrength = 4;
 input bool   SB_EnableDebug     = true;
-// SB Confidence Model
+// SB Confidence Model (Additive Path)
 input int    SB_Bonus_ZE        = 25;
 input int    SB_Bonus_BC        = 25;
 input int    SB_Bonus_SMC       = 25;
+input int    SB_BaseConf        = 40;
 // BC Pass-Through
 input int    SB_BC_FastMA       = 10;
 input int    SB_BC_SlowMA       = 30;
@@ -319,7 +344,7 @@ input int      Trail_Start_Pips    = 22;
 input int      Trail_Stop_Pips     = 10;
 //--- Entry Filter Inputs (M15 Baseline) ---
 input group "Entry Filters"
-input int        MinConfidence        = 50; // TICKET #2: Default changed to 50
+input int        MinConfidence        = 50;
 // --- T011: Over-extension Inputs ---
 input group "Over-extension Guard"
 input ENUM_OVEREXT_MODE OverExtMode = WaitForBand;
@@ -327,14 +352,26 @@ input int    OverExt_MA_Period      = 20;
 input int    OverExt_ATR_Period     = 14;
 input double OverExt_ATR_Mult       = 2.0;
 input int    OverExt_WaitBars       = 3;
+
+//--- T022: Volatility Regime Inputs ---
+input group "Volatility Regime"
+input bool   InpVR_Enable       = true;
+input int    InpVR_ATR_Period   = 14;
+input int    InpVR_MinBps       = 8;   // 0.08%
+input int    InpVR_MaxBps       = 60;  // 0.60%
+enum ENUM_VR_Mode { VR_OFF=0, VR_REQUIRED=1, VR_PREFERRED=2 };
+input ENUM_VR_Mode InpVR_Mode = VR_REQUIRED;
+input int    InpVR_PrefPenalty = 4;
+
+
 //--- Confluence Module Inputs (M15 Baseline) ---
 input group "Confluence Modules"
-input ENUM_BC_ALIGN_MODE BC_AlignMode   = BC_REQUIRED; // TICKET #2: Changed to REQUIRED
-input ENUM_ZE_GATE_MODE  ZE_Gate        = ZE_REQUIRED; // TICKET #2: Changed to REQUIRED
-input int        ZE_MinStrength       = 4; // This is now checked against raw ZE strength from SB
+input ENUM_BC_ALIGN_MODE BC_AlignMode   = BC_REQUIRED;
+input ENUM_ZE_GATE_MODE  ZE_Gate        = ZE_REQUIRED;
+input int        ZE_MinStrength       = 4;
 
 enum SMCMode { SMC_OFF=0, SMC_PREFERRED=1, SMC_REQUIRED=2 };
-input SMCMode SMC_Mode = SMC_REQUIRED; // TICKET #2: Changed to REQUIRED
+input SMCMode SMC_Mode = SMC_REQUIRED;
 input int     SMC_MinConfidence = 7;
 
 //--- Journaling Inputs ---
@@ -355,11 +392,11 @@ int       g_logged_positions_total = 0;
 static int g_overext_wait = 0;
 // --- TICKET #3: Over-extension timing fix ---
 static datetime g_last_overext_dec_sigbar = 0;
-
-// --- TICKET #2: Simplified Persistent Indicator Handles ---
+// --- Simplified Persistent Indicator Handles ---
 int sb_handle = INVALID_HANDLE;
-int g_hATR = INVALID_HANDLE;
+int g_hATR = INVALID_HANDLE; 
 int g_hOverextMA = INVALID_HANDLE;
+int g_hATR_VR = INVALID_HANDLE; // T022: New handle for Volatility Regime
 
 // --- State Management Globals ---
 static datetime g_lastBarTime = 0;
@@ -382,7 +419,8 @@ static long g_blk_ze       = 0;
 static long g_blk_bc       = 0;
 static long g_blk_over     = 0;
 static long g_blk_spread   = 0;
-static long g_blk_smc      = 0; // TICKET #2: Added SMC block counter
+static long g_blk_smc      = 0;
+static long g_blk_vr       = 0; // T022: New counter
 static bool g_summary_printed = false;
 // --- Once-per-bar stamps for block counters ---
 datetime g_stamp_conf  = 0;
@@ -395,6 +433,7 @@ datetime g_stamp_atr   = 0;
 datetime g_stamp_cool  = 0;
 datetime g_stamp_bar   = 0;
 datetime g_stamp_smc   = 0;
+datetime g_stamp_vr    = 0; // T022: New stamp
 datetime g_stamp_none  = 0;
 datetime g_stamp_approval = 0;
 
@@ -413,7 +452,7 @@ datetime g_stamp_hyb = 0;     // once-per-bar stamp
 void PrintSummary()
 {
     if(g_summary_printed) return;
-    PrintFormat("AAI_SUMMARY|entries=%d|wins=%d|losses=%d|ze_blk=%d|bc_blk=%d|smc_blk=%d|overext_blk=%d|spread_blk=%d",
+    PrintFormat("AAI_SUMMARY|entries=%d|wins=%d|losses=%d|ze_blk=%d|bc_blk=%d|smc_blk=%d|overext_blk=%d|spread_blk=%d|vr_blk=%d",
                 g_entries,
                 g_wins,
                 g_losses,
@@ -421,9 +460,81 @@ void PrintSummary()
                 g_blk_bc,
                 g_blk_smc,
                 g_blk_over,
-                g_blk_spread);
+                g_blk_spread,
+                g_blk_vr);
     g_summary_printed = true;
 }
+
+//--- TICKET T021: New Caching Helper ---
+bool UpdateSBCacheIfNewBar()
+{
+  datetime t = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1);
+  if(t == 0) return false;                    // no history yet
+  if(g_sb.valid && g_sb.closed_bar_time == t) // same bar → already cached
+    return true;
+
+  // Read all 7 buffers for shift=1 in one shot
+  double v;
+  // Signal
+  if(!Read1(sb_handle, 0, 1, v, "SB")) { g_sb.valid=false; return false; }
+  g_sb.sig = (int)MathRound(v);
+  // Confidence
+  if(!Read1(sb_handle, 1, 1, v, "SB")) { g_sb.valid=false; return false; }
+  g_sb.conf = v;
+  // Reason
+  if(!Read1(sb_handle, 2, 1, v, "SB")) { g_sb.valid=false; return false; }
+  g_sb.reason = (int)MathRound(v);
+  // ZE
+  if(!Read1(sb_handle, 3, 1, v, "SB")) { g_sb.valid=false; return false; }
+  g_sb.ze = v;
+  // SMC signal
+  if(!Read1(sb_handle, 4, 1, v, "SB")) { g_sb.valid=false; return false; }
+  g_sb.smc_sig = (int)MathRound(v);
+  // SMC conf
+  if(!Read1(sb_handle, 5, 1, v, "SB")) { g_sb.valid=false; return false; }
+  g_sb.smc_conf = v;
+  // BC
+  if(!Read1(sb_handle, 6, 1, v, "SB")) { g_sb.valid=false; return false; }
+  g_sb.bc = (int)MathRound(v);
+
+  g_sb.closed_bar_time = t;
+  g_sb.valid = true;
+  return true;
+}
+
+//--- TICKET T022: New Volatility Regime Gate ---
+bool VolatilityRegimeGate(double &conf /* in/out */)
+{
+  if(!InpVR_Enable || InpVR_Mode==VR_OFF) return true;
+  double atrv[1], closev[1];
+  if(CopyBuffer(g_hATR_VR, 0, 1, 1, atrv) != 1) return true; // be permissive on read fail
+  
+  MqlRates rates[];
+  if(CopyRates(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1, 1, rates) != 1) return true;
+  closev[0] = rates[0].close;
+
+  if (closev[0] == 0) return true; // Avoid division by zero
+  
+  double atr_bps = (atrv[0] / closev[0]) * 10000.0;
+  bool out_of_band = (atr_bps < InpVR_MinBps || atr_bps > InpVR_MaxBps);
+
+  if(!out_of_band) return true;
+
+  if(InpVR_Mode == VR_REQUIRED){
+    AAI_Block("vr");
+    if(g_stamp_vr != g_lastBarTime){ g_blk_vr++; g_stamp_vr = g_lastBarTime; }
+    return false;
+  }
+  // preferred: penalize confidence; do not block
+  conf = MathMax(0.0, conf - InpVR_PrefPenalty);
+  return true;
+}
+
+
+// ====================== AAI JOURNAL HELPERS ======================
+// ... (rest of file is identical)
+
+
 // ====================== AAI JOURNAL HELPERS ======================
 #ifndef AAI_EA_LOG_DEFINED
 #define AAI_EA_LOG_DEFINED
@@ -598,6 +709,7 @@ void LogPerBarStatus(int sig, double conf, int reason, double ze, int bc)
     Print(logLine);
     AAI_AppendJournal(logLine);
 }
+//... (rest of the file is identical) ...
 
 
 //+------------------------------------------------------------------+
@@ -859,6 +971,7 @@ int OnInit()
    g_blk_over = 0;
    g_blk_spread = 0;
    g_summary_printed = false;
+   g_sb.valid = false; // Initialize cache as invalid
 
 // --- Initialize locals/state ---
 symbolName = _Symbol;
@@ -1216,10 +1329,18 @@ void OnTick()
       ManageOpenPositions(dt, false);
    }
 
-datetime bar_time = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 0);
-if(bar_time == 0 || bar_time == g_lastBarTime) return;
-g_lastBarTime = bar_time;
-
+   // TICKET T021: Use the cache helper
+   if(!UpdateSBCacheIfNewBar() && MQLInfoInteger(MQL_TESTER))
+   {
+       // During warmup or on a read fail, we might still need to log a neutral line for the journal
+       if(g_sb.closed_bar_time != g_last_per_bar_journal_time)
+       {
+           LogPerBarStatus(0, 0, 0, 0, 0);
+           UpdateHUD(0, 0, 0, 0, 0);
+       }
+       return;
+   }
+   
    CheckForNewTrades();
 }
 
@@ -1229,11 +1350,25 @@ g_lastBarTime = bar_time;
 //+------------------------------------------------------------------+
 void CheckForNewTrades()
 {
+   // --- TICKET T021: Use cached data ---
+   int    direction    = g_sb.sig;
+   int    reason       = g_sb.reason;
+   int    smc_sig      = g_sb.smc_sig;
+   int    bc_bias      = g_sb.bc;
+   double final_conf   = g_sb.conf;
+   double ze_strength  = g_sb.ze;
+   double smc_conf     = g_sb.smc_conf;
+
+   // --- Update Visuals and Journaling with the cached data ---
+   LogPerBarStatus(direction, final_conf, reason, ze_strength, bc_bias);
+   UpdateHUD(direction, final_conf, reason, ze_strength, bc_bias);
+
+
    // --- EA Warmup Gate (T003) ---
    long bars_avail = Bars(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe);
    if (bars_avail < WarmupBars)
    {
-datetime barTime = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 0);
+       datetime barTime = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 0);
        if (g_last_ea_warmup_log_time != barTime)
        {
            PrintFormat("[WARMUP] t=%s sb_handle_ok=%d need=%d have=%d",
@@ -1258,32 +1393,6 @@ datetime barTime = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 0);
        return;
    }
    
-   const int readShift = MathMax(1, SB_ReadShift);
-   
-   // --- TICKET #2: Read all data from SignalBrain in one go ---
-   double dSig=0,dConf=0,dReason=0,dZE=0,dSMC_S=0,dSMC_C=0,dBC=0;
-   bool ok=true;
-   ok&=Read1(sb_handle,SB_BUF_SIGNAL,  readShift,dSig,   "SB");
-   ok&=Read1(sb_handle,SB_BUF_CONF,    readShift,dConf,  "SB");
-   ok&=Read1(sb_handle,SB_BUF_REASON,  readShift,dReason,"SB");
-   ok&=Read1(sb_handle,SB_BUF_ZE,      readShift,dZE,    "SB");
-   ok&=Read1(sb_handle,SB_BUF_SMC_SIG, readShift,dSMC_S, "SB");
-   ok&=Read1(sb_handle,SB_BUF_SMC_CONF,readShift,dSMC_C, "SB");
-   ok&=Read1(sb_handle,SB_BUF_BC,      readShift,dBC,    "SB");
-   if(!ok) return; // closed-bar discipline
-   
-   int    direction    =(int)MathRound(dSig);
-   int    reason       =(int)MathRound(dReason);
-   int    smc_sig      =(int)MathRound(dSMC_S);
-   int    bc_bias      =(int)MathRound(dBC);
-   double final_conf   = dConf;
-   double ze_strength  = dZE;
-   double smc_conf     = dSMC_C;
-
-   // --- Update Visuals and Journaling with the new data ---
-   LogPerBarStatus(direction, final_conf, reason, ze_strength, bc_bias);
-   UpdateHUD(direction, final_conf, reason, ze_strength, bc_bias);
-
    // --- Signal Gate ---
    if(direction == 0) return;
 
@@ -1301,16 +1410,17 @@ datetime barTime = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 0);
    }
    if(!sess_ok) { AAI_Block("session"); return; }
    
-   datetime signal_bar_time = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, readShift);
+   datetime signal_bar_time = g_sb.closed_bar_time;
    
    // --- T011 & TICKET #3: Over-extension Gate ---
    static datetime last_overext_log_time = 0;
    double mid = 0, atr = 0, px = 0;
-double _tmp_ma_[1];
-if (CopyBuffer(g_hOverextMA, 0, 1, 1, _tmp_ma_) == 1)  mid = _tmp_ma_[0]; else mid = 0.0;
+   double _tmp_ma_[1];
+   if (CopyBuffer(g_hOverextMA, 0, 1, 1, _tmp_ma_) == 1)  mid = _tmp_ma_[0]; else mid = 0.0;
 
-double _tmp_atr_[1];
-if (CopyBuffer(g_hATR, 0, 1, 1, _tmp_atr_) == 1)       atr = _tmp_atr_[0]; else atr = 0.0;
+   double _tmp_atr_[1];
+   if (CopyBuffer(g_hATR, 0, 1, 1, _tmp_atr_) == 1)       atr = _tmp_atr_[0];
+   else atr = 0.0;
 
    px = iClose(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1);
    
@@ -1367,7 +1477,7 @@ if (CopyBuffer(g_hATR, 0, 1, 1, _tmp_atr_) == 1)       atr = _tmp_atr_[0]; else 
       }
    }
 
-    // --- TICKET #2: Adapted Gating Logic ---
+    // --- Adapted Gating Logic ---
     // ZE Gate
     if(ZE_Gate == ZE_REQUIRED && ze_strength < ZE_MinStrength)
     {
@@ -1416,7 +1526,7 @@ if (CopyBuffer(g_hATR, 0, 1, 1, _tmp_atr_) == 1)       atr = _tmp_atr_[0]; else 
    string trigger = "";
    double sbSig_prev=0;
    // We need to read the previous bar's signal from SB to detect an edge
-   Read1(sb_handle, SB_BUF_SIGNAL, readShift + 1, sbSig_prev, "SB_Prev");
+   Read1(sb_handle, SB_BUF_SIGNAL, SB_ReadShift + 1, sbSig_prev, "SB_Prev");
 
    bool is_edge = (direction != (int)sbSig_prev);
    if(EntryMode == FirstBarOrEdge && !g_bootstrap_done) trigger = "bootstrap";
@@ -1432,7 +1542,7 @@ if (CopyBuffer(g_hATR, 0, 1, 1, _tmp_atr_) == 1)       atr = _tmp_atr_[0]; else 
       if(trigger == "bootstrap") g_bootstrap_done = true;
    }
 }
-
+//... (rest of the file is identical) ...
 //+------------------------------------------------------------------+
 //| Helper function to get the string representation of a reason code|
 //+------------------------------------------------------------------+
