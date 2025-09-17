@@ -1,236 +1,187 @@
 //+------------------------------------------------------------------+
 //|                     AAI_Include_News.mqh                         |
-//|                  v1.0 - News/Event CSV Gate                      |
-//|              Copyright 2025, AlfredAI Project                    |
+//|               Handles news/event gating from CSV                 |
+//|                   Copyright 2025, AlfredAI Project               |
+//|                 https://github.com/rudikai/alfredai              |
 //+------------------------------------------------------------------+
 #ifndef AAI_INCLUDE_NEWS_MQH
 #define AAI_INCLUDE_NEWS_MQH
 
 #property strict
 
-#include <Arrays/ArrayObj.mqh>
-#include <Arrays/ArrayString.mqh>
-
-// --- For parsing CSV
-#ifndef AAI_STR_TRIM_DEFINED
-#define AAI_STR_TRIM_DEFINED
-void AAI_Trim(string &s)
+// --- CSV format: time_utc, scope, impact, window_before_min, window_after_min, title
+struct NewsEvent
 {
-   StringTrimLeft(s);
-   StringTrimRight(s);
-}
-#endif
+   datetime time_utc;
+   string   scope;
+   string   impact; // "High", "Medium", "Low"
+   long     window_before_sec;
+   long     window_after_sec;
+};
 
-// --- Enum from EA for consistency
+// --- Matches EA Inputs ---
 enum ENUM_NEWS_Mode { NEWS_OFF=0, NEWS_REQUIRED=1, NEWS_PREFERRED=2 };
 
 //+------------------------------------------------------------------+
-//| Holds the data for a single parsed news event.                   |
-//+------------------------------------------------------------------+
-class CNewsEvent : public CObject
-{
-public:
-    datetime time_event;
-    string   scope;
-    string   impact;
-    long     before_sec;
-    long     after_sec;
-    string   title;
-};
-
-//+------------------------------------------------------------------+
-//| Manages loading and checking against a news event CSV.           |
+//| AAI_NewsGate Class                                               |
+//| Manages loading and checking against a news event CSV file.      |
 //+------------------------------------------------------------------+
 class AAI_NewsGate
 {
 private:
-    CArrayObj* m_events;
-    bool              m_enabled;
-    ENUM_NEWS_Mode    m_mode;
-    bool              m_times_are_utc;
-    bool              m_filter_high;
-    bool              m_filter_medium;
-    bool              m_filter_low;
-    int               m_penalty;
-    
-    string            m_symbol_base;
-    string            m_symbol_quote;
-    
-    //+--------------------------------------------------------------+
-    //| Loads and parses the news CSV from the common files path.    |
-    //+--------------------------------------------------------------+
-    void LoadCsv(const string csv_name)
-    {
-        if(csv_name == "" || m_events == NULL) return;
+   bool           m_enabled;
+   ENUM_NEWS_Mode m_mode;
+   bool           m_times_are_utc;
+   bool           m_filter_high;
+   bool           m_filter_medium;
+   bool           m_filter_low;
+   int            m_penalty;
+   NewsEvent      m_events[];
 
-        int handle = FileOpen(csv_name, FILE_READ | FILE_TXT | FILE_COMMON | FILE_ANSI);
-        if(handle == INVALID_HANDLE)
-        {
-            // Fail-open: if file is missing, we just don't have any events. Log once.
-            if(!MQLInfoInteger(MQL_TESTER)) // Don't spam tester logs
-                PrintFormat("[NewsGate] WARN: CSV file not found at MQL5\\Files\\%s. Gate will be permissive.", csv_name);
-            return;
-        }
+   //+------------------------------------------------------------------+
+   //| Parses a single line from the CSV file.                          |
+   //+------------------------------------------------------------------+
+   bool ParseLine(const string line, NewsEvent &ev)
+     {
+      string parts[];
+      if(StringSplit(line, ',', parts) < 5)
+         return false;
 
-        while(!FileIsEnding(handle))
-        {
-            string line = FileReadString(handle);
-            AAI_Trim(line);
+      // 1. Time
+      ev.time_utc = StringToTime(parts[0]);
+      if(ev.time_utc <= 0) return false;
 
-            if(StringGetCharacter(line, 0) == '#' || line == "") continue;
+      // 2. Scope
+      StringTrimLeft(parts[1]); StringTrimRight(parts[1]);
+      ev.scope = parts[1];
 
-            string parts[];
-            if(StringSplit(line, ',', parts) < 5) continue;
+      // 3. Impact
+      StringTrimLeft(parts[2]); StringTrimRight(parts[2]);
+      ev.impact = parts[2];
 
-            CNewsEvent *event = new CNewsEvent();
-            if(!event) continue;
+      // 4. Window Before/After (minutes -> seconds)
+      ev.window_before_sec = (long)StringToInteger(parts[3]) * 60;
+      ev.window_after_sec  = (long)StringToInteger(parts[4]) * 60;
 
-            // 1. Time
-            string time_str = parts[0];
-            AAI_Trim(time_str);
-            event.time_event = StringToTime(time_str);
-            
-            // 2. Scope
-            event.scope = parts[1];
-            AAI_Trim(event.scope);
-
-            // 3. Impact
-            event.impact = parts[2];
-            AAI_Trim(event.impact);
-
-            // 4. Window Before (minutes)
-            event.before_sec = (long)StringToInteger(parts[3]) * 60;
-
-            // 5. Window After (minutes)
-            event.after_sec = (long)StringToInteger(parts[4]) * 60;
-            
-            // 6. Title (optional)
-            if(ArraySize(parts) > 5)
-            {
-               event.title = parts[5];
-               AAI_Trim(event.title);
-            }
-
-            m_events.Add(event);
-        }
-        
-        FileClose(handle);
-        PrintFormat("[NewsGate] Loaded %d events from %s.", m_events.Total(), csv_name);
-    }
+      return true;
+     }
 
 public:
-    //+--------------------------------------------------------------+
-    //| Constructor                                                  |
-    //+--------------------------------------------------------------+
-    AAI_NewsGate()
-    {
-        m_events = new CArrayObj();
-        m_enabled = false;
-    }
+               AAI_NewsGate() {}
 
-    //+--------------------------------------------------------------+
-    //| Destructor                                                   |
-    //+--------------------------------------------------------------+
-   ~AAI_NewsGate()
-    {
-if(m_events != NULL && CheckPointer(m_events) != POINTER_INVALID)
+   //+------------------------------------------------------------------+
+   //| Initializes the gate and loads the CSV file.                     |
+   //+------------------------------------------------------------------+
+   void Init(bool enable, string csv_name, ENUM_NEWS_Mode mode, bool is_utc, bool f_h, bool f_m, bool f_l, int penalty)
+     {
+      m_enabled       = enable;
+      m_mode          = mode;
+      m_times_are_utc = is_utc;
+      m_filter_high   = f_h;
+      m_filter_medium = f_m;
+      m_filter_low    = f_l;
+      m_penalty       = penalty;
+
+      ArrayFree(m_events);
+
+      if(!m_enabled || m_mode == NEWS_OFF)
         {
-for(int i = m_events.Total() - 1; i >= 0; --i) { delete m_events.At(i); }
-m_events.Clear();
-            delete m_events;
-        }
-    }
-
-    //+--------------------------------------------------------------+
-    //| Initializes the gate with settings from the EA.              |
-    //+--------------------------------------------------------------+
-    bool Init(
-        bool enable,
-        string csv_name,
-        ENUM_NEWS_Mode mode,
-        bool times_are_utc,
-        bool filter_high,
-        bool filter_medium,
-        bool filter_low,
-        int penalty
-    )
-    {
-        m_enabled = enable;
-        if(!m_enabled || mode == NEWS_OFF) return true;
-        
-        m_mode = mode;
-        m_times_are_utc = times_are_utc;
-        m_filter_high = filter_high;
-        m_filter_medium = filter_medium;
-        m_filter_low = filter_low;
-        m_penalty = penalty;
-        
-        // Get symbol currencies for scope matching
-        m_symbol_base = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_BASE);
-        m_symbol_quote = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_PROFIT);
-
-if(m_events != NULL && CheckPointer(m_events) != POINTER_INVALID)
-        {
-            m_events.Clear();
-            LoadCsv(csv_name);
-        }
-        
-        return true;
-    }
-
-    //+--------------------------------------------------------------+
-    //| Checks if the current time falls within a news event window. |
-    //+--------------------------------------------------------------+
-    bool CheckGate(datetime now_server, double &confidence)
-    {
-        if(!m_enabled || m_mode == NEWS_OFF || m_events.Total() == 0) return true;
-
-        datetime now_check = m_times_are_utc ? TimeGMT() : now_server;
-
-        for(int i = 0; i < m_events.Total(); i++)
-        {
-            CNewsEvent *event = (CNewsEvent*)m_events.At(i);
-            if(!event) continue;
-
-            // Filter by Impact
-            if((StringFind(event.impact, "High", 0) >= 0 && !m_filter_high) ||
-               (StringFind(event.impact, "Medium", 0) >= 0 && !m_filter_medium) ||
-               (StringFind(event.impact, "Low", 0) >= 0 && !m_filter_low))
-            {
-                continue;
-            }
-            
-            // Filter by Scope
-            bool scope_match = (event.scope == "*" ||
-                                event.scope == _Symbol ||
-                                event.scope == m_symbol_base ||
-                                event.scope == m_symbol_quote);
-            
-            if(!scope_match) continue;
-            
-            // Check if current time is inside the event window
-datetime window_start = (datetime)((long)event.time_event - (long)event.before_sec);
-datetime window_end   = (datetime)((long)event.time_event + (long)event.after_sec);
-            
-            if(now_check >= window_start && now_check <= window_end)
-            {
-                if(m_mode == NEWS_REQUIRED)
-                {
-                    // Block the trade
-                    return false;
-                }
-                else if(m_mode == NEWS_PREFERRED)
-                {
-                    // Apply penalty and continue checking other gates
-                    confidence = MathMax(0, confidence - m_penalty);
-                    // One penalty is enough, no need to check other news events
-                    return true; 
-                }
-            }
+         Print("[NEWS] Gate disabled by inputs.");
+         return;
         }
 
-        return true; // No blocking news event found
-    }
+      int handle = FileOpen(csv_name, FILE_READ|FILE_TXT|FILE_COMMON, ',', CP_UTF8);
+      if(handle == INVALID_HANDLE)
+        {
+         PrintFormat("[NEWS_WARN] Failed to open news file '%s' (error %d). Gate will be open.", csv_name, GetLastError());
+         m_enabled = false; // Fail-open
+         return;
+        }
+
+      int count = 0;
+      while(!FileIsEnding(handle))
+        {
+         string line = FileReadString(handle);
+         StringTrimLeft(line);
+         if(StringLen(line) == 0 || StringGetCharacter(line, 0) == '#')
+            continue;
+
+         NewsEvent ev;
+         if(ParseLine(line, ev))
+           {
+            int size = ArraySize(m_events);
+            ArrayResize(m_events, size + 1);
+            m_events[size] = ev;
+            count++;
+           }
+        }
+      FileClose(handle);
+      PrintFormat("[NEWS] Loaded %d events from '%s'.", count, csv_name);
+     }
+
+   //+------------------------------------------------------------------+
+   //| Checks if the current time falls within any filtered news event. |
+   //| Returns false if blocked (REQUIRED) or true if passed.         |
+   //| Modifies conf_io if penalized (PREFERRED).                     |
+   //| Sets is_in_window_flag to 1 if in a news window, else 0.       |
+   //+------------------------------------------------------------------+
+   bool CheckGate(datetime server_now, double &conf_io, int &is_in_window_flag)
+     {
+      is_in_window_flag = 0; // Default to not in window
+      if(!m_enabled || m_mode == NEWS_OFF)
+         return true;
+
+      datetime now_utc = server_now;
+      if(!m_times_are_utc)
+        {
+         long server_offset = TimeGMTOffset();
+         now_utc = (datetime)((long)server_now - server_offset);
+        }
+
+      string sym_base = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_BASE);
+      string sym_quote = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_PROFIT);
+
+      for(int i = 0; i < ArraySize(m_events); i++)
+        {
+         const NewsEvent ev = m_events[i]; // FIX: Removed reference (&)
+
+         // --- Filter by impact ---
+         bool impact_match = (m_filter_high   && ev.impact == "High")   ||
+                             (m_filter_medium && ev.impact == "Medium") ||
+                             (m_filter_low    && ev.impact == "Low");
+         if(!impact_match)
+            continue;
+
+         // --- Filter by scope ---
+         bool scope_match = (ev.scope == "*" || ev.scope == _Symbol ||
+                             ev.scope == sym_base || ev.scope == sym_quote);
+         if(!scope_match)
+            continue;
+
+         // --- Check time window ---
+         datetime start_block = (datetime)((long)ev.time_utc - ev.window_before_sec); // FIX: Explicit cast
+         datetime end_block   = (datetime)((long)ev.time_utc + ev.window_after_sec);  // FIX: Explicit cast
+
+         if(now_utc >= start_block && now_utc <= end_block)
+           {
+            is_in_window_flag = 1; // We are in a news window
+            if(m_mode == NEWS_REQUIRED)
+              {
+               return false; // Block
+              }
+            else if(m_mode == NEWS_PREFERRED)
+              {
+               conf_io = MathMax(0.0, conf_io - m_penalty);
+              }
+            // A match was found, no need to check other events
+            return true;
+           }
+        }
+
+      // No matching event found in a blocking window
+      return true;
+     }
 };
 
 #endif // AAI_INCLUDE_NEWS_MQH
+
