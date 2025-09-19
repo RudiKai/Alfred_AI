@@ -2845,13 +2845,17 @@ bool GateOverExtension(string &reason_id)
                 }
                 else
                 {
-                    if(g_sb.closed_bar_time != g_last_overext_dec_sigbar)
-                    {
-                        g_overext_wait--;
-                        g_last_overext_dec_sigbar = g_sb.closed_bar_time;
-                    }
+if(g_sb.closed_bar_time != g_last_overext_dec_sigbar)
+{
+    g_overext_wait--;
 
-                    if(g_sb.closed_bar_time != last_overext_log_time)
+    // If the wait just expired, allow the trade this bar.
+    if(g_overext_wait <= 0)
+        return true;
+
+    g_last_overext_dec_sigbar = g_sb.closed_bar_time;
+}
+
                     {
                         PrintFormat("[OVEREXT_WAIT] t=%s left=%d dir=%d", TimeToString(g_sb.closed_bar_time), g_overext_wait, direction);
                         last_overext_log_time = g_sb.closed_bar_time;
