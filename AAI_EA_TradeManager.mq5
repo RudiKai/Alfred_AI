@@ -2888,6 +2888,8 @@ sb_handle = iCustom(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, AAI_Ind("AAI_Indi
                   SB_MinZoneStrength, SB_EnableDebug,
                   // SB Confidence Model
                   SB_Bonus_ZE, SB_Bonus_BC, SB_Bonus_SMC,
+                  // missing, now added baseconf
+                  SB_BaseConf, 
                   // BC Pass-Through
                   SB_BC_FastMA, SB_BC_SlowMA,
                   // ZE Pass-Through
