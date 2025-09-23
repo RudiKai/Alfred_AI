@@ -211,7 +211,7 @@ bool T50_AllowedNow(const datetime bar_time)
 const bool   PHW_Enable            = true;
 const int    PHW_FailBurstN          = 3;
 const int    PHW_FailBurstWindowSec  = 15;
-const int    PHW_SpreadSpikePoints   = 25;
+const int    PHW_SpreadSpikePoints   = 500;
 const int    PHW_CooldownMinSec      = 60;
 const int    PHW_CooldownMaxSec      = 900;
 const double PHW_BackoffMultiplier   = 1.8;
@@ -571,7 +571,7 @@ input bool   AlertsDryRun      = true;
 //--- Session Inputs (idempotent) ---
 #ifndef AAI_SESSION_INPUTS_DEFINED
 #define AAI_SESSION_INPUTS_DEFINED
-input bool SessionEnable = true;
+input bool SessionEnable = false;
 input int  SessionStartHourServer = 8; // server time
 input int  SessionEndHourServer   = 23;  // server time
 #endif
@@ -659,7 +659,7 @@ input bool        InpPT_LogVerbose      = false;
 
 //--- Entry Filter Inputs (M15 Baseline) ---
 input group "Entry Filters"
-input int               MinConfidence        = 4;  /// Blocks at >15 / 4 for testing / 7-12 
+input int               MinConfidence        = 4; 
 // --- T011: Over-extension Inputs ---
 input group "Over-extension Guard"
 input ENUM_OVEREXT_MODE OverExtMode = WaitForBand;
@@ -773,7 +773,7 @@ input int                  InpOSR_SlipPtsStep    = 5;
 input int                  InpOSR_SlipPtsMax     = 25;
 enum ENUM_OSR_PriceMode { OSR_USE_LAST=0, OSR_USE_CURRENT=1 };
 input ENUM_OSR_PriceMode InpOSR_PriceMode = OSR_USE_CURRENT;
-input bool                 InpOSR_AllowIOC       = false; ////// at least on mt5 demo, it uses fok
+input bool                 InpOSR_AllowIOC       = false; 
 input bool                 InpOSR_LogVerbose     = false;
 
 // --- SL/TP Safety & MinStops Auto-Adjust (T033) ---
@@ -812,9 +812,9 @@ input int   SMC_MinConfidence = 7;
 
 //--- Journaling Inputs ---
 input group "Journaling"
-input bool   EnableJournaling      = false;        /////during testing, start with false
+input bool   EnableJournaling      = false;        
 input string JournalFileName       = "AlfredAI_Journal.csv";
-input bool   JournalUseCommonFiles = false;        //// false during testing
+input bool   JournalUseCommonFiles = false;        
 
 // --- Decision Journaling (T026) ---
 input group "Decision Journaling"
