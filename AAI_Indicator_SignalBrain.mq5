@@ -187,15 +187,12 @@ int OnInit()
     }
     if(SB_UseBC)
     {
-        BC_handle = iCustom(_Symbol, _Period, AAI_Ind("AAI_Indicator_BiasCompass"),
-                    SB_BC_FastMA, SB_BC_SlowMA);
+        BC_handle = iCustom(_Symbol, _Period, AAI_Ind("AAI_Indicator_BiasCompass"), SB_BC_FastMA, SB_BC_SlowMA);
         if(BC_handle == INVALID_HANDLE) Print("[SB_WARN] Failed to create BiasCompass handle.");
     }
     if(SB_UseSMC)
     {
-        SMC_handle = iCustom(_Symbol, _Period, AAI_Ind("AAI_Indicator_SMC"),
-                     SB_SMC_UseFVG, SB_SMC_UseOB, SB_SMC_UseBOS,
-                     SB_SMC_FVG_MinPips, SB_SMC_OB_Lookback, SB_SMC_BOS_Lookback);
+        SMC_handle = iCustom(_Symbol, _Period, AAI_Ind("AAI_Indicator_SMC"), SB_SMC_UseFVG, SB_SMC_UseOB, SB_SMC_UseBOS, SB_SMC_FVG_MinPips, SB_SMC_OB_Lookback, SB_SMC_BOS_Lookback);
         if(SMC_handle == INVALID_HANDLE) Print("[SB_WARN] Failed to create SMC handle.");
     }
     return(INIT_SUCCEEDED);
