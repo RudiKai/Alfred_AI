@@ -56,9 +56,9 @@ int    AAI_dur_count   = 0;
 
 // ==================== /AAI METRICS ======================
 //+------------------------------------------------------------------+
-//| AAI_EA_Trade_Manager.mq5                                         |
+//| AAI_EA_Trade_Manager.mq5                                         |       
 //|                                       v5.12 - Telemetry v2       |
-//|                                                                  |
+//|            HEDGING INPUTS ADDED                                  |
 //| (Consumes all data from the refactored AAI_Indicator_SignalBrain)|
 //|                                                                  |
 //| Copyright 2025, AlfredAI Project                                 |
@@ -499,10 +499,10 @@ input int    SB_SlowMA           = 30;
 input int    SB_MinZoneStrength  = 4;
 input bool   SB_EnableDebug      = true;
 // SB Confidence Model (Additive Path)
-input int    SB_Bonus_ZE         = 25;
-input int    SB_Bonus_BC         = 25;
-input int    SB_Bonus_SMC        = 25;
-input int    SB_BaseConf         = 40;
+input int    SB_Bonus_ZE         = 4;
+input int    SB_Bonus_BC         = 4;
+input int    SB_Bonus_SMC        = 4;
+input int    SB_BaseConf         = 4;
 // BC Pass-Through
 input int    SB_BC_FastMA        = 10;
 input int    SB_BC_SlowMA        = 30;
@@ -551,6 +551,18 @@ input int    MaxSlippagePoints   = 20;
 input int    FridayCloseHour     = 22;
 input bool   EnableLogging       = true;
 //--- Telegram Alerts ---
+// --- Hedging & Pyramiding ---
+input group "--- Hedging & Pyramiding ---"
+input bool   InpHEDGE_AllowMultiple        = true;    // allow many positions per symbol (hedging)
+input bool   InpHEDGE_AllowOpposite        = true;    // allow long+short at same time
+input int    InpHEDGE_MaxPerSymbol         = 5;       // cap all positions on symbol (this EA's magic)
+input int    InpHEDGE_MaxLongPerSymbol     = 5;       // cap longs
+input int    InpHEDGE_MaxShortPerSymbol    = 5;       // cap shorts
+input int    InpHEDGE_MinStepPips          = 50;      // min distance between entries on same side
+input bool   InpHEDGE_SplitRiskAcrossPyr   = true;    // divide risk across the pyramid
+input double InpHEDGE_MaxAggregateRiskPct  = 3.0;     // cap total risk % on this symbol (optional)
+
+
 input group "Telegram Alerts"
 input bool   UseTelegramFromEA = false;
 input string TelegramToken       = "";
@@ -560,16 +572,16 @@ input bool   AlertsDryRun      = true;
 #ifndef AAI_SESSION_INPUTS_DEFINED
 #define AAI_SESSION_INPUTS_DEFINED
 input bool SessionEnable = true;
-input int  SessionStartHourServer = 9; // server time
+input int  SessionStartHourServer = 8; // server time
 input int  SessionEndHourServer   = 23;  // server time
 #endif
 
 #ifndef AAI_HYBRID_INPUTS_DEFINED
 #define AAI_HYBRID_INPUTS_DEFINED
 // Auto-trading window (server time). Outside -> alerts only.
-input string AutoHourRanges = "8-14,19-23";   // comma-separated hour ranges
+input string AutoHourRanges = "8-14,17-23";   // comma-separated hour ranges
 // Day mask for auto-trading (server time): Sun=0..Sat=6
-input bool AutoSun=false, AutoMon=true, AutoTue=true, AutoWed=false, AutoThu=true, AutoFri=true, AutoSat=false;
+input bool AutoSun=false, AutoMon=true, AutoTue=true, AutoWed=true, AutoThu=true, AutoFri=true, AutoSat=false;
 // Alert channels + throttle
 input bool   HybridAlertPopup       = true;
 input bool   HybridAlertPush        = true; // requires terminal Push enabled
@@ -647,7 +659,7 @@ input bool        InpPT_LogVerbose      = false;
 
 //--- Entry Filter Inputs (M15 Baseline) ---
 input group "Entry Filters"
-input int               MinConfidence        = 50;
+input int               MinConfidence        = 4;  /// Blocks at >15 / 4 for testing / 7-12 
 // --- T011: Over-extension Inputs ---
 input group "Over-extension Guard"
 input ENUM_OVEREXT_MODE OverExtMode = WaitForBand;
@@ -663,8 +675,8 @@ input int            InpVR_ATR_Period  = 14;
 input int            InpVR_MinBps      = 8;   // 0.08%
 input int            InpVR_MaxBps      = 60;  // 0.60%
 enum ENUM_VR_Mode { VR_OFF=0, VR_REQUIRED=1, VR_PREFERRED=2 };
-input ENUM_VR_Mode InpVR_Mode = VR_REQUIRED;
-input int            InpVR_PrefPenalty = 4;
+input ENUM_VR_Mode InpVR_Mode = VR_PREFERRED;
+input int            InpVR_PrefPenalty = 4;  
 
 //--- News/Event Gate Inputs (T024) ---
 input group "News/Event Gate"
@@ -761,7 +773,7 @@ input int                  InpOSR_SlipPtsStep    = 5;
 input int                  InpOSR_SlipPtsMax     = 25;
 enum ENUM_OSR_PriceMode { OSR_USE_LAST=0, OSR_USE_CURRENT=1 };
 input ENUM_OSR_PriceMode InpOSR_PriceMode = OSR_USE_CURRENT;
-input bool                 InpOSR_AllowIOC       = true;
+input bool                 InpOSR_AllowIOC       = false; ////// at least on mt5 demo, it uses fok
 input bool                 InpOSR_LogVerbose     = false;
 
 // --- SL/TP Safety & MinStops Auto-Adjust (T033) ---
@@ -800,9 +812,9 @@ input int   SMC_MinConfidence = 7;
 
 //--- Journaling Inputs ---
 input group "Journaling"
-input bool   EnableJournaling      = true;
+input bool   EnableJournaling      = false;        /////during testing, start with false
 input string JournalFileName       = "AlfredAI_Journal.csv";
-input bool   JournalUseCommonFiles = true;
+input bool   JournalUseCommonFiles = false;        //// false during testing
 
 // --- Decision Journaling (T026) ---
 input group "Decision Journaling"
@@ -1066,8 +1078,9 @@ bool UpdateSBCacheIfNewBar()
 {
   datetime t = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 1);
   if(t == 0) return false;       // no history yet
-  if(g_sb.valid && g_sb.closed_bar_time == t) // same bar -> already cached
-    return true;
+// new: same bar → nothing to do; only return true on a NEW bar
+if(g_sb.valid && g_sb.closed_bar_time == t)
+    return false;
 
   // Read all 7 buffers for shift=1 in one shot
   double v;
@@ -1724,12 +1737,21 @@ double CRC_MapConfToRisk(const int conf)
 //+------------------------------------------------------------------+
 //| Calculate Lot Size                                               |
 //+------------------------------------------------------------------+
+
 double CalculateLotSize(const int confidence, const double sl_distance_price)
 {
   const double sl_pts = sl_distance_price / point;
-  const double risk_pct = CRC_MapConfToRisk(confidence);
+  double risk_pct = CRC_MapConfToRisk(confidence);
+
+  if(InpHEDGE_AllowMultiple && InpHEDGE_SplitRiskAcrossPyr && g_sb.sig!=0)
+  {
+     int L=0,S=0; CountMyPositions(_Symbol, (long)MagicNumber, L, S);
+     const int sideCount = (g_sb.sig>0 ? L : S);
+     if(sideCount>0) risk_pct = risk_pct / (1.0 + sideCount);
+  }
   return LotsFromRiskAndSL(risk_pct, sl_pts);
 }
+
 
 //+------------------------------------------------------------------+
 //| >>> T030: Risk Guard Helpers <<<                                 |
@@ -2672,6 +2694,9 @@ void EA_RejectHistoryFromString(const string s)
 {
     ArrayInitialize(g_ea_state.rej_history, 0);
     int len = StringLen(s);
+
+    // Do NOT set rej_count here. The caller (SP_Load) does it.
+
     for(int i = 0; i < len && i < EA_RejWindowTrades; i++) {
         g_ea_state.rej_history[i] = (int)StringToInteger(StringSubstr(s, i, 1));
     }
@@ -2884,19 +2909,19 @@ SP_Load();
 // --- TICKET #2: Create the single, centralized SignalBrain handle ---
 sb_handle = iCustom(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, AAI_Ind("AAI_Indicator_SignalBrain"),
                   // Core SB Settings
-                  SB_SafeTest, SB_UseZE, SB_UseBC, SB_UseSMC, SB_WarmupBars, SB_FastMA, SB_SlowMA,
+                  SB_SafeTest, SB_UseZE, SB_UseBC, SB_UseSMC,
+                  SB_WarmupBars, SB_FastMA, SB_SlowMA,
                   SB_MinZoneStrength, SB_EnableDebug,
                   // SB Confidence Model
                   SB_Bonus_ZE, SB_Bonus_BC, SB_Bonus_SMC,
-                  // missing, now added baseconf
-                  SB_BaseConf, 
+                  SB_BaseConf,
                   // BC Pass-Through
                   SB_BC_FastMA, SB_BC_SlowMA,
                   // ZE Pass-Through
                   SB_ZE_MinImpulseMovePips,
                   // SMC Pass-Through
-                  SB_SMC_UseFVG, SB_SMC_UseOB, SB_SMC_UseBOS, SB_SMC_FVG_MinPips,
-                  SB_SMC_OB_Lookback, SB_SMC_BOS_Lookback
+                  SB_SMC_UseFVG, SB_SMC_UseOB, SB_SMC_UseBOS,
+                  SB_SMC_FVG_MinPips, SB_SMC_OB_Lookback, SB_SMC_BOS_Lookback
                 );
 
 if(sb_handle == INVALID_HANDLE)
@@ -3409,49 +3434,70 @@ if(trans.type == TRADE_TRANSACTION_DEAL_ADD && HistoryDealSelect(trans.deal))
 //+------------------------------------------------------------------+
 //| >>> T028: Adaptive Spread Tick Sampler <<<                       |
 //+------------------------------------------------------------------+
+// Sample current spread (in POINTS) and append to the adaptive-spread buffer.
+// Works on variable-spread brokers (no reliance on SYMBOL_SPREAD).
+// Sample current spread (in POINTS) and append to the adaptive-spread buffer.
+// Bounded & cadence-aware: respects InpAS_SampleEveryNTicks and InpAS_SamplesPerBarMax,
+// and rolls bar medians into a fixed-size ring buffer (g_as_bar_medians) to avoid growth.
 void AS_OnTickSample()
 {
-  if(!InpAS_Enable || InpAS_Mode==AS_OFF) return;
+   if(!InpAS_Enable || InpAS_Mode==AS_OFF) return;
 
-  // Detect bar change on the forming bar (shift=0)
-  datetime forming = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 0);
-  if(g_as_forming_bar_time == 0) g_as_forming_bar_time = forming;
+   // 1) Detect new bar on the configured SignalTimeframe and finalize the previous bar's median
+   datetime cur_bar_time = iTime(_Symbol, (ENUM_TIMEFRAMES)SignalTimeframe, 0);
+   if(g_as_forming_bar_time != 0 && cur_bar_time != g_as_forming_bar_time)
+   {
+      const int n = ArraySize(g_as_samples);
+      if(n > 0)
+      {
+         // Compute median of samples for the just-closed bar
+         double tmp[]; ArrayResize(tmp, n);
+         for(int i=0;i<n;i++) tmp[i]=g_as_samples[i];
+         ArraySort(tmp);
+         const double med = (n%2!=0 ? tmp[n/2] : 0.5*(tmp[n/2-1] + tmp[n/2]));
 
-  if(forming != g_as_forming_bar_time){
-    // The previous forming bar just closed → finalize its spread median
-    if(ArraySize(g_as_samples) > 0){
-      // Make a copy and sort to compute median
-      double tmp[]; ArrayCopy(tmp, g_as_samples);
-      ArraySort(tmp);
-      const int n = ArraySize(tmp);
-      double bar_median = (n%2 != 0 ? tmp[n/2] : 0.5*(tmp[n/2-1] + tmp[n/2]));
+         // Push into ring buffer g_as_bar_medians
+         int cap = ArraySize(g_as_bar_medians);
+         if(cap <= 0){ ArrayResize(g_as_bar_medians, 1); cap = 1; }
+         g_as_bar_medians[g_as_hist_pos] = med;
+         g_as_hist_pos = (g_as_hist_pos + 1) % cap;
+         if(g_as_hist_count < cap) g_as_hist_count++;
+      }
 
-      // Push into ring buffer
-      if(g_as_hist_count < ArraySize(g_as_bar_medians)) g_as_hist_count++;
-      g_as_bar_medians[g_as_hist_pos] = bar_median;
-      g_as_hist_pos = (g_as_hist_pos + 1) % ArraySize(g_as_bar_medians);
-    }
-    // Reset for new forming bar
-    ArrayResize(g_as_samples, 0);
-    g_as_tick_ctr = 0;
-    g_as_forming_bar_time = forming;
-  }
+      // Reset per-bar state
+      ArrayResize(g_as_samples, 0);
+      g_as_tick_ctr = 0;
+      g_as_exceeded_for_bar = false;
+      g_as_forming_bar_time = cur_bar_time;
+   }
 
-  // Sample this tick
-  g_as_tick_ctr++;
-  if(g_as_tick_ctr % MathMax(1, InpAS_SampleEveryNTicks) != 0) return;
-  if(ArraySize(g_as_samples) >= InpAS_SamplesPerBarMax) return;
+   // 2) Tick-cadence gating
+   g_as_tick_ctr++;
+   if(InpAS_SampleEveryNTicks > 1 && (g_as_tick_ctr % InpAS_SampleEveryNTicks) != 0)
+      return;
 
-  // Use current spread in POINTS (reuse your helper if you have one)
-  long spr = 0;
-  if(SymbolInfoInteger(_Symbol, SYMBOL_SPREAD, spr)){
-    // SYMBOL_SPREAD is in points; store as double
-    const double spr_pts = (double)spr;
-    int sz = ArraySize(g_as_samples);
-    ArrayResize(g_as_samples, sz+1);
-    g_as_samples[sz] = spr_pts;
-  }
+   // 3) Per-bar cap on samples
+   if(InpAS_SamplesPerBarMax > 0 && ArraySize(g_as_samples) >= InpAS_SamplesPerBarMax)
+      return;
+
+   // 4) Fetch spread in points (robust on variable-spread brokers)
+   double spr_pts = CurrentSpreadPoints();
+   if(spr_pts <= 0.0)
+   {
+      const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      if(ask > 0.0 && bid > 0.0)
+         spr_pts = (ask - bid) / _Point;
+   }
+   if(spr_pts <= 0.0) return;
+
+   // 5) Append to this bar's sample buffer (bounded by step 3)
+   int sz = ArraySize(g_as_samples);
+   ArrayResize(g_as_samples, sz + 1);
+   g_as_samples[sz] = spr_pts;
 }
+
+
 
 //+------------------------------------------------------------------+
 //| OnTick: Event-driven logic                                       |
@@ -3466,9 +3512,9 @@ void OnTick()
 
    if(PositionSelect(_Symbol))
    {
-   MqlDateTime dt;
-   TimeToStruct(TimeCurrent(), dt);
-   ManageOpenPositions(dt, false);
+// [DISABLED LEGACY TM]    MqlDateTime dt;
+// [DISABLED LEGACY TM]    TimeToStruct(TimeCurrent(), dt);
+// [DISABLED LEGACY TM]    ManageOpenPositions(dt, false);
    }
 
    // TICKET T021: Use the cache helper
@@ -3920,14 +3966,22 @@ bool GateOverExtension(string &reason_id)
                 }
                 else
                 {
+// ... inside GateOverExtension() ...
 if(g_sb.closed_bar_time != g_last_overext_dec_sigbar)
 {
-  g_overext_wait--;
+    if(g_overext_wait > 0) // Only decrement if we are actively waiting
+    {
+        g_overext_wait--; 
+    }
+    g_last_overext_dec_sigbar = g_sb.closed_bar_time;
+}
 
-  if(g_overext_wait <= 0)
-    return true;
-
-  g_last_overext_dec_sigbar = g_sb.closed_bar_time;
+if(g_overext_wait > 0)
+{
+    // ... logging ...
+    reason_id = "overext";
+    if(g_stamp_over != g_sb.closed_bar_time){ g_blk_over++; g_stamp_over = g_sb.closed_bar_time; }
+    return false;
 }
 
                     if(g_sb.closed_bar_time != last_overext_log_time)
@@ -4291,16 +4345,121 @@ bool GateDebounce(const int direction, string &reason_id)
     return true;
 }
 
-// --- Gate 20: Position ---
+
+// --- Hedging utilities ---
+int CountMyPositions(const string sym, const long magic, int &longCnt, int &shortCnt)
+{
+   longCnt = 0; shortCnt = 0; int total = 0;
+   for(int i = PositionsTotal()-1; i >= 0; --i)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != sym) continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) != magic) continue;
+      int t = (int)PositionGetInteger(POSITION_TYPE);
+      if(t == POSITION_TYPE_BUY)  ++longCnt;
+      if(t == POSITION_TYPE_SELL) ++shortCnt;
+      ++total;
+   }
+   return total;
+}
+
+double LastEntryPriceOnSide(const string sym, const long magic, const bool isLong)
+{
+   datetime lastTime = 0; double px = 0.0;
+   uint total = HistoryDealsTotal();
+   for(int i = (int)total-1; i >= 0; --i)
+   {
+      ulong deal = HistoryDealGetTicket(i);
+      if(HistoryDealGetString(deal, DEAL_SYMBOL) != sym) continue;
+      if((long)HistoryDealGetInteger(deal, DEAL_MAGIC) != magic) continue;
+      int tp = (int)HistoryDealGetInteger(deal, DEAL_TYPE);
+      if( (isLong && tp == DEAL_TYPE_BUY) || (!isLong && tp == DEAL_TYPE_SELL) )
+      {
+         datetime when = (datetime)HistoryDealGetInteger(deal, DEAL_TIME);
+         if(when > lastTime){ lastTime = when; px = HistoryDealGetDouble(deal, DEAL_PRICE); }
+      }
+   }
+   return px;
+}
+
+double ComputePositionRiskPct(const ulong ticket)
+{
+   if(!PositionSelectByTicket(ticket)) return 0.0;
+   const string sym = PositionGetString(POSITION_SYMBOL);
+   const double vol = PositionGetDouble(POSITION_VOLUME);
+   const double sl  = PositionGetDouble(POSITION_SL);
+   const double op  = PositionGetDouble(POSITION_PRICE_OPEN);
+   const int    typ = (int)PositionGetInteger(POSITION_TYPE);
+   if(sl <= 0.0 || vol <= 0.0) return 0.0;
+
+   const double dist_pts = MathAbs( (typ==POSITION_TYPE_BUY ? op-sl : sl-op) ) / _Point;
+   const double tick_val = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
+   const double tick_sz  = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+   const double money_per_point = (tick_sz > 0.0 ? (tick_val/tick_sz) : tick_val) * vol;
+   const double money_risk = dist_pts * money_per_point;
+   const double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   return (eq > 0.0 ? 100.0 * money_risk / eq : 0.0);
+}
+
+double ComputeAggregateRiskPct(const string sym, const long magic)
+{
+   double acc = 0.0;
+   for(int i = PositionsTotal()-1; i >= 0; --i)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != sym) continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) != magic) continue;
+      acc += ComputePositionRiskPct(ticket);
+   }
+   return acc;
+}
+
+
+// --- Gate 20: Position (hedging-aware) ---
 bool GatePosition(string &reason_id)
 {
-    if(PositionSelect(_Symbol))
+    if(!InpHEDGE_AllowMultiple)
     {
-        reason_id = "position_exists";
-        return false;
+        if(PositionSelect(_Symbol)) { reason_id = "position_exists"; return false; }
+        return true;
+    }
+
+    int dir = g_sb.sig; // -1 sell, +1 buy (from SB cache)
+    int longCnt, shortCnt;
+    const int total = CountMyPositions(_Symbol, (long)MagicNumber, longCnt, shortCnt);
+
+    if(total >= InpHEDGE_MaxPerSymbol)                  { reason_id="hedge_cap_total";  return false; }
+    if(dir>0 && longCnt  >= InpHEDGE_MaxLongPerSymbol)  { reason_id="hedge_cap_long";   return false; }
+    if(dir<0 && shortCnt >= InpHEDGE_MaxShortPerSymbol) { reason_id="hedge_cap_short";  return false; }
+
+    if(!InpHEDGE_AllowOpposite)
+    {
+        if( (dir>0 && shortCnt>0) || (dir<0 && longCnt>0) ) { reason_id="hedge_no_opposite"; return false; }
+    }
+
+    if(InpHEDGE_MinStepPips>0 && dir!=0)
+    {
+        const bool isLong = (dir>0);
+        const double lastPx = LastEntryPriceOnSide(_Symbol, (long)MagicNumber, isLong);
+        if(lastPx>0.0)
+        {
+            const double pxNow = (isLong ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                                         : SymbolInfoDouble(_Symbol, SYMBOL_ASK));
+            const double stepPips = MathAbs(pxNow-lastPx)/(_Point*10.0); // 10 points = 1 pip on 5-digit
+            if(stepPips < InpHEDGE_MinStepPips) { reason_id="hedge_step_too_small"; return false; }
+        }
+    }
+
+    if(InpHEDGE_MaxAggregateRiskPct>0.0)
+    {
+        const double agg = ComputeAggregateRiskPct(_Symbol, (long)MagicNumber);
+        if(agg >= InpHEDGE_MaxAggregateRiskPct) { reason_id="hedge_agg_risk_cap"; return false; }
     }
     return true;
 }
+
 
 // --- Gate 21: Trigger ---
 bool GateTrigger(const int direction, const int prev_sb_sig, string &reason_id)
