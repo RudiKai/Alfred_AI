@@ -333,7 +333,9 @@ struct SBReadCache {
   bool     valid;
 };
 static SBReadCache g_sb;
-
+//////////////////////////// fixing sendfail errors
+enum ENUM_OSR_FillMode { OSR_FILL_IOC, OSR_FILL_FOK, OSR_FILL_DEFAULT };
+/////////////////////
 
 // --- T006: HUD Object Name ---
 const string HUD_OBJECT_NAME = "AAI_HUD";
@@ -494,8 +496,8 @@ input bool   SB_UseZE            = true;
 input bool   SB_UseBC            = true;
 input bool   SB_UseSMC           = true;
 input int    SB_WarmupBars       = 150;
-input int    SB_FastMA           = 10;
-input int    SB_SlowMA           = 30;
+input int    SB_FastMA           = 5;
+input int    SB_SlowMA           = 12;
 input int    SB_MinZoneStrength  = 4;
 input bool   SB_EnableDebug      = true;
 // SB Confidence Model (Additive Path)
@@ -504,8 +506,8 @@ input int    SB_Bonus_BC         = 4;
 input int    SB_Bonus_SMC        = 4;
 input int    SB_BaseConf         = 4;
 // BC Pass-Through
-input int    SB_BC_FastMA        = 10;
-input int    SB_BC_SlowMA        = 30;
+input int    SB_BC_FastMA        = 5;
+input int    SB_BC_SlowMA        = 12;
 // ZE Pass-Through
 input double SB_ZE_MinImpulseMovePips = 10.0;
 // SMC Pass-Through
@@ -773,7 +775,7 @@ input int                  InpOSR_SlipPtsStep    = 5;
 input int                  InpOSR_SlipPtsMax     = 25;
 enum ENUM_OSR_PriceMode { OSR_USE_LAST=0, OSR_USE_CURRENT=1 };
 input ENUM_OSR_PriceMode InpOSR_PriceMode = OSR_USE_CURRENT;
-input bool                 InpOSR_AllowIOC       = false; 
+input ENUM_OSR_FillMode  InpOSR_FillMode       = OSR_FILL_DEFAULT; 
 input bool                 InpOSR_LogVerbose     = false;
 
 // --- SL/TP Safety & MinStops Auto-Adjust (T033) ---
@@ -1945,12 +1947,14 @@ bool OSR_IsRetryable(const uint retcode)
     case TRADE_RETCODE_REQUOTE:
     case TRADE_RETCODE_PRICE_OFF:
     case TRADE_RETCODE_REJECT:
-    case 10025: // TRADE_RETCODE_NO_CONNECTION:
-    case 10026: // TRADE_RETCODE_TRADE_CONTEXT_BUSY:
+    case TRADE_RETCODE_INVALID_FILL:     // allow adapting and retrying on fill-policy errors
+    case 10025: // TRADE_RETCODE_NO_CONNECTION
+    case 10026: // TRADE_RETCODE_TRADE_CONTEXT_BUSY
       return true;
   }
   return false;
 }
+
 
 //+------------------------------------------------------------------+
 //| >>> T045: Multi-Symbol Orchestration Helpers <<<                 |
@@ -2017,11 +2021,45 @@ bool MSO_MaySend(const string sym)
 }
 
 //+------------------------------------------------------------------+
-//| >>> T031: Core OSR Sender <<<                                    |
+                ////             |
 //+------------------------------------------------------------------+
+// --- OSR helper: resolve a valid market fill mode for this symbol (IOC/FOK/RETURN)
+ENUM_ORDER_TYPE_FILLING ResolveMarketFill(const int user_mode)
+{
+   // Some servers return a bitmask of allowed fills; some return a single enum value (0/1/2).
+   const long fm = (long)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+
+   // Treat both forms: bitmask (1<<ORDER_FILLING_*) OR exact equality.
+   const bool ioc_ok = ((fm & (1 << ORDER_FILLING_IOC))    != 0) || (fm == ORDER_FILLING_IOC);
+   const bool fok_ok = ((fm & (1 << ORDER_FILLING_FOK))    != 0) || (fm == ORDER_FILLING_FOK);
+   const bool ret_ok = ((fm & (1 << ORDER_FILLING_RETURN)) != 0) || (fm == ORDER_FILLING_RETURN);
+
+   // Respect user's choice when supported
+   if(user_mode == OSR_FILL_IOC && ioc_ok) return ORDER_FILLING_IOC;
+   if(user_mode == OSR_FILL_FOK && fok_ok) return ORDER_FILLING_FOK;
+
+   // DEFAULT: use server’s declared policy first when it’s a single value
+   if(user_mode == OSR_FILL_DEFAULT) {
+      if(fm == ORDER_FILLING_IOC)    return ORDER_FILLING_IOC;
+      if(fm == ORDER_FILLING_FOK)    return ORDER_FILLING_FOK;
+      if(fm == ORDER_FILLING_RETURN) return ORDER_FILLING_RETURN;
+      // Or pick a sensible preference when fm looked like a mask
+      if(ioc_ok) return ORDER_FILLING_IOC;
+      if(fok_ok) return ORDER_FILLING_FOK;
+      if(ret_ok) return ORDER_FILLING_RETURN;
+   }
+
+   // Fallback preference: IOC -> FOK -> RETURN
+   if(ioc_ok) return ORDER_FILLING_IOC;
+   if(fok_ok) return ORDER_FILLING_FOK;
+   if(ret_ok) return ORDER_FILLING_RETURN;
+
+   // Ultimate fallback (rare)
+   return ORDER_FILLING_FOK;
+}
 
 //+------------------------------------------------------------------+ 
-//| >>> T031: Core OSR Sender <<<                                    |
+//| >>> T031: Core OSR Sender (fail-open) <<<                        |
 //+------------------------------------------------------------------+
 bool OSR_SendMarket(const int direction,
                     double lots,
@@ -2030,27 +2068,34 @@ bool OSR_SendMarket(const int direction,
                     double &tp_io,
                     MqlTradeResult &lastRes)
 {
-  // Closed-bar timestamp for throttles/failsafe
+  ZeroMemory(lastRes);
+
   const datetime bt = iTime(_Symbol, (ENUM_TIMEFRAMES)_Period, 1);
 
-  // Global multi-symbol orchestrator (non-blocking)
+  // --- SOFT guards (do not block sending)
   if(!MSO_MaySend(_Symbol))
   {
       if(MSO_LogVerbose && bt != g_stamp_mso)
       {
-          PrintFormat("[MSO] defer OSR sym=%s reason=guard", _Symbol);
+          PrintFormat("[MSO] guard (soft) sym=%s", _Symbol);
           g_stamp_mso = bt;
       }
-      return false;
+      // continue
   }
-
-  // T49/T50: account-wide throttle + failsafe (non-blocking)
-  if(!T49_MayOpenThisBar(bt)) return false;
-  if(!T50_AllowedNow(bt))     return false;
+  if(!T49_MayOpenThisBar(bt))
+  {
+      if(InpOSR_LogVerbose) Print("[T49] throttle (soft)");
+      // continue
+  }
+  if(!T50_AllowedNow(bt))
+  {
+      if(InpOSR_LogVerbose) Print("[T50] window/off-hours (soft)");
+      // continue
+  }
 
   if(!InpOSR_Enable)
   {
-    // Single attempt via CTrade (adaptive deviation; T040)
+    trade.SetTypeFillingBySymbol(_Symbol);
     trade.SetDeviationInPoints(EA_GetAdaptiveDeviation());
     const bool order_sent = (direction > 0)
                             ? trade.Buy(lots, _Symbol, 0.0, sl_io, tp_io, g_last_comment)
@@ -2059,9 +2104,8 @@ bool OSR_SendMarket(const int direction,
     return order_sent;
   }
 
-  // Retry-capable path
   int retries   = MathMax(0, InpOSR_MaxRetries);
-  int deviation = EA_GetAdaptiveDeviation(); // T040 adaptive slip
+  int deviation = EA_GetAdaptiveDeviation();
 
   for(int attempt=0; attempt<=retries; ++attempt)
   {
@@ -2078,7 +2122,7 @@ bool OSR_SendMarket(const int direction,
     req.symbol        = _Symbol;
     req.volume        = NormalizeLots(lots);
     req.type          = (direction>0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
-    req.type_filling  = (InpOSR_AllowIOC ? ORDER_FILLING_IOC : ORDER_FILLING_FOK);
+    req.type_filling  = ResolveMarketFill((int)InpOSR_FillMode);
     req.deviation     = (ulong)dev_use;
     req.magic         = MagicNumber;
     req.comment       = g_last_comment;
@@ -2092,7 +2136,51 @@ bool OSR_SendMarket(const int direction,
     }
     req.price = p; req.sl = sl; req.tp = tp;
 
-    if(OrderSend(req, lastRes) && (lastRes.retcode==TRADE_RETCODE_DONE || lastRes.retcode==TRADE_RETCODE_DONE_PARTIAL))
+    // --- Preflight & fallback for fill policy
+    MqlTradeCheckResult chk; ZeroMemory(chk);
+    bool ok_check = OrderCheck(req, chk);
+
+    if(!ok_check || chk.retcode != TRADE_RETCODE_DONE)
+    {
+       if(chk.retcode == TRADE_RETCODE_INVALID_FILL || !ok_check)
+       {
+          ENUM_ORDER_TYPE_FILLING broker_fill =
+            (ENUM_ORDER_TYPE_FILLING)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+          if(broker_fill != req.type_filling)
+          {
+             req.type_filling = broker_fill;
+             ZeroMemory(chk);
+             ok_check = OrderCheck(req, chk);
+          }
+
+          if(!ok_check || chk.retcode != TRADE_RETCODE_DONE)
+          {
+             ENUM_ORDER_TYPE_FILLING alt =
+               (req.type_filling == ORDER_FILLING_IOC ? ORDER_FILLING_FOK : ORDER_FILLING_IOC);
+             req.type_filling = alt;
+             ZeroMemory(chk);
+             ok_check = OrderCheck(req, chk);
+          }
+
+          if(!ok_check || chk.retcode != TRADE_RETCODE_DONE)
+          {
+             if(InpOSR_LogVerbose)
+                PrintFormat("[OSR] preflight fail: INVALID_FILL after fallbacks (mask=%ld)", 
+                            (long)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE));
+             T50_RecordSendFailure(bt);
+             return false;
+          }
+       }
+       // else: other precheck errors fall through to send
+    }
+
+    // --- Send
+    if(InpOSR_LogVerbose)
+      PrintFormat("[OSR] send dir=%d lots=%.2f price=%.5f fill=%d dev=%d",
+                  direction, req.volume, req.price, (int)req.type_filling, (int)req.deviation);
+
+    if(OrderSend(req, lastRes) &&
+       (lastRes.retcode==TRADE_RETCODE_DONE || lastRes.retcode==TRADE_RETCODE_DONE_PARTIAL))
     {
       price_io = p; sl_io = sl; tp_io = tp;
       return true;
