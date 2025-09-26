@@ -824,6 +824,15 @@ input bool   InpDJ_Enable      = false;
 input string InpDJ_FileName    = "AAI_Decisions.csv";
 input bool   InpDJ_Append      = true;
 
+// ... after your other input groups ...
+
+// --- Anti-Zombie Controls (AZ) ---
+input group "--- Anti-Zombie Controls (AZ) ---"
+input bool   InpAZ_TTL_Enable        = true;     // Enable max trade lifetime (Time-To-Live)
+input int    InpAZ_TTL_Hours         = 8;        // Max age of any position in hours
+input bool   InpAZ_SessionForceFlat  = true;     // Force-close all positions outside the session window
+input int    InpAZ_PrefExitMins      = 10;       // Minutes before session end to start closing
+
 //--- Globals
 CTrade   trade;
 string   symbolName;
@@ -1039,6 +1048,12 @@ datetime g_stamp_slc   = 0; // T039
 datetime g_stamp_mso   = 0; // T045
 datetime g_stamp_none  = 0;
 datetime g_stamp_approval = 0;
+
+// ... after g_stamp_approval or similar globals ...
+
+// --- T_AZ: Auto-Zone Globals ---
+static int g_ttl_secs;
+static int g_pref_exit_secs;
 
 #ifndef AAI_HYBRID_STATE_DEFINED
 #define AAI_HYBRID_STATE_DEFINED
@@ -1882,6 +1897,100 @@ int EA_GetAdaptiveDeviation()
     g_last_dev_pts = final_dev; // T042: Store for telemetry
     return final_dev;
 }
+//+------------------------------------------------------------------+
+//| T_AZ: Helper to check if we are inside the session window        |
+//+------------------------------------------------------------------+
+bool AZ_IsInsideSession(int &seconds_to_end)
+{
+    seconds_to_end = 2147483647; // Max int value
+    if(!SessionEnable) return true; // If sessions aren't used, it's always "inside"
+
+    MqlDateTime dt;
+    TimeToStruct(TimeCurrent(), dt);
+    long now_secs_of_day = dt.hour * 3600 + dt.min * 60 + dt.sec;
+    
+    long start_secs = (long)SessionStartHourServer * 3600;
+    long end_secs   = (long)SessionEndHourServer * 3600;
+
+    // Check if the current day is an active trading day
+    bool day_on = ((dt.day_of_week==0 && AutoSun) || (dt.day_of_week==1 && AutoMon) || (dt.day_of_week==2 && AutoTue) ||
+                   (dt.day_of_week==3 && AutoWed) || (dt.day_of_week==4 && AutoThu) || (dt.day_of_week==5 && AutoFri) ||
+                   (dt.day_of_week==6 && AutoSat));
+    if(!day_on) return false;
+    
+    // Handle normal vs. overnight sessions
+    if (start_secs <= end_secs) // Normal session (e.g., 8:00 - 23:00)
+    {
+        if (now_secs_of_day >= start_secs && now_secs_of_day < end_secs)
+        {
+            seconds_to_end = (int)(end_secs - now_secs_of_day);
+            return true;
+        }
+    }
+    else // Overnight session (e.g., 22:00 - 05:00)
+    {
+        if (now_secs_of_day >= start_secs || now_secs_of_day < end_secs)
+        {
+            if (now_secs_of_day >= start_secs)
+                seconds_to_end = (int)((end_secs + 86400) - now_secs_of_day);
+            else
+                seconds_to_end = (int)(end_secs - now_secs_of_day);
+            return true;
+        }
+    }
+    return false;
+}
+
+
+//+------------------------------------------------------------------+
+//| Failsafe Exit Logic to catch orphaned trades                     |
+//+------------------------------------------------------------------+
+void FailsafeExitChecks()
+{
+    // Initialize CTrade object for this function's scope
+    trade.SetExpertMagicNumber(MagicNumber);
+    
+    // Check session status once per call
+    int seconds_to_end;
+    bool is_inside_session = AZ_IsInsideSession(seconds_to_end);
+
+    // Loop through all open positions to apply hard-exit rules
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i); // Safe way to get ticket
+        if(PositionSelectByTicket(ticket))   // Safe way to select position
+        {
+            // Only manage positions for this symbol and magic number
+            if(PositionGetString(POSITION_SYMBOL) == _Symbol && (long)PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+            {
+                // --- AZ Failsafe 1: Time-To-Live (Max Duration) ---
+                if(InpAZ_TTL_Enable && g_ttl_secs > 0)
+                {
+                    long open_time = PositionGetInteger(POSITION_TIME);
+                    if((TimeCurrent() - open_time) >= g_ttl_secs)
+                    {
+                         PrintFormat("[AZ_TTL] Closing position #%d. Exceeded max duration of %d hours.", ticket, InpAZ_TTL_Hours);
+                         if(!trade.PositionClose(ticket)) { PHW_LogFailure(trade.ResultRetcode()); }
+                         continue; // Position is closed, move to the next one
+                    }
+                }
+
+                // --- AZ Failsafe 2: Session Force-Flat ---
+                if(InpAZ_SessionForceFlat)
+                {
+                    // Close if we are completely outside the session OR if we are inside but near the end
+                    if(!is_inside_session || (is_inside_session && seconds_to_end <= g_pref_exit_secs))
+                    {
+                        PrintFormat("[AZ_SESSION] Closing position #%d. Outside session or within pre-exit window.", ticket);
+                        if(!trade.PositionClose(ticket)) { PHW_LogFailure(trade.ResultRetcode()); }
+                        continue; // Position is closed, move to the next one
+                    }
+                }
+            }
+        }
+    }
+}
+
 //+------------------------------------------------------------------+
 //| >>> T031: Order Send Robustness Helpers <<<                      |
 //+------------------------------------------------------------------+
@@ -2928,6 +3037,11 @@ int OnInit()
    g_blk_slc = 0; // T039
    g_summary_printed = false;
    g_sb.valid = false; // Initialize cache as invalid
+   
+   // ... inside OnInit() ...
+// --- T_AZ: Initialize Auto-Zone cached variables ---
+g_ttl_secs = InpAZ_TTL_Hours * 3600;
+g_pref_exit_secs = InpAZ_PrefExitMins * 60;
 
 // --- Initialize locals/state ---
 symbolName = _Symbol;
@@ -3592,6 +3706,7 @@ void AS_OnTickSample()
 //+------------------------------------------------------------------+
 void OnTick()
 {
+FailsafeExitChecks();
    AS_OnTickSample();    // T028 sampler
    HM_OnTick();          // T034 harmonizer worker
    PT_OnTick();          // T036 partial profit worker
